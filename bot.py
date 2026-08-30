@@ -30,7 +30,8 @@ log = get_logger("bot")
 def cmd_run(args):
     from src.agent.loop import MemecoinAgent
     cfg = load_config()
-    if args.mock:
+    # Safely read --mock (only present when subparser is used)
+    if getattr(args, "mock", False):
         cfg["_env"]["helius_api_key"] = ""
         cfg["_env"]["birdeye_api_key"] = ""
         cfg["_env"]["telegram_bot_token"] = ""
@@ -44,7 +45,7 @@ def cmd_once(args):
     """Run a single scan cycle and print verdicts."""
     from src.agent.loop import MemecoinAgent
     cfg = load_config()
-    if args.mock:
+    if getattr(args, "mock", False):
         cfg["_env"]["helius_api_key"] = ""
         cfg["_env"]["birdeye_api_key"] = ""
     agent = MemecoinAgent(cfg)
@@ -112,13 +113,13 @@ def main():
         "stats": cmd_stats,
         "test-rules": cmd_test_rules,
     }
-    handler = handlers.get(args.cmd, cmd_run)
     if args.cmd is None:
-        # Default: run
-        handler = cmd_run
-        handler(args)
-    else:
-        handler(args)
+        # No subcommand: default to "run" in production mode.
+        # Build a clean args namespace so handlers can safely use
+        # getattr(args, "mock", False).
+        args = argparse.Namespace(cmd="run", mock=False)
+    handler = handlers[args.cmd]
+    handler(args)
 
 
 if __name__ == "__main__":
