@@ -1,0 +1,43 @@
+# --- Secrets (NEVER commit these) ---
+.env
+*.env.local
+*.env.production
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv/
+
+# --- Build / distribution ---
+build/
+dist/
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Agent runtime state ---
+# Comment these out if you WANT to commit pre-computed wallet scores
+# and the paper ledger to your repo. Default: keep them out so Railway
+# rebuilds scoring from scratch on each deploy.
+data/wallet_scores.json
+data/paper_ledger.json
+data/alerts.log
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# --- Logs ---
+logs/
+*.log

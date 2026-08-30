@@ -1,0 +1,299 @@
+"""
+Telegram alerter with mock fallback.
+
+If real credentials are present, sends real alerts and polls for commands
+(/stats, /pause, /resume, /positions, /help) from the configured chat.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, Optional
+
+import httpx
+
+from src.utils.logger import get_logger
+from src.rules.engine import Verdict, Tier
+
+log = get_logger("telegram")
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ALERTS_LOG = PROJECT_ROOT / "data" / "alerts.log"
+
+
+class TelegramAlerter:
+    def __init__(self, bot_token: str = "", chat_id: str = ""):
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.enabled = bool(bot_token and chat_id)
+        # Two clients: one for sending (short timeout), one for long-polling
+        self._client = httpx.AsyncClient(timeout=10.0)
+        self._poll_client = httpx.AsyncClient(timeout=60.0)
+        # Sync client for the polling thread (long-poll from a separate thread)
+        self._sync_send_client = None
+        self._today_count = 0
+        self._today_date = datetime.utcnow().date()
+        self._paused = False
+        self._command_handlers: Dict[str, Callable] = {}
+        self._polling_thread = None
+        self._stop_polling = __import__('threading').Event()
+        self._offset = 0
+        # Last reply context for commands that need richer data
+        self._ctx: Dict[str, Any] = {}
+
+        if not self.enabled:
+            log.warning("Telegram running in MOCK mode (no credentials)")
+        ALERTS_LOG.parent.mkdir(exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Command registration
+    # ------------------------------------------------------------------
+    def register_command(self, name: str, handler: Callable[[str], Awaitable[str]]):
+        """Register a /command handler. Handler receives the args string, returns response text."""
+        self._command_handlers[name] = handler
+        log.debug(f"Registered Telegram command: /{name}")
+
+    def set_context(self, **kwargs):
+        """Set context that command handlers can access (e.g. agent state)."""
+        self._ctx.update(kwargs)
+
+    # ------------------------------------------------------------------
+    # Sending
+    # ------------------------------------------------------------------
+    async def send_verdict(self, verdict: Verdict, daily_cap: int = 50) -> bool:
+        """Send a verdict alert. Returns True if sent, False if rate-limited."""
+        if self._paused:
+            log.debug("Alerts paused - skipping verdict")
+            return False
+
+        # Daily cap check
+        today = datetime.utcnow().date()
+        if today != self._today_date:
+            self._today_count = 0
+            self._today_date = today
+        if self._today_count >= daily_cap:
+            log.warning(f"Daily alert cap ({daily_cap}) reached. Skipping.")
+            return False
+
+        # Only send Tier A and B (high-conviction)
+        if verdict.tier == Tier.C:
+            return False
+
+        text = verdict.to_alert()
+        ok = await self._send(text)
+        if ok:
+            self._today_count += 1
+            self._log_to_file(verdict, text)
+        return ok
+
+    async def send_text(self, text: str) -> bool:
+        """Send a freeform text message."""
+        return await self._send(text)
+
+    async def _send(self, text: str) -> bool:
+        if not self.enabled:
+            log.info(f"[MOCK TELEGRAM] Would send:\n{text}\n")
+            return True
+        try:
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            r = await self._client.post(url, json={
+                "chat_id": self.chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            })
+            if r.status_code != 200:
+                log.error(f"Telegram send failed ({r.status_code}): {r.text[:200]}")
+                return False
+            return True
+        except Exception as e:
+            log.error(f"Telegram send failed: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Command polling (long-polling getUpdates)
+    # ------------------------------------------------------------------
+    def start_polling(self):
+        """Start the background command-polling thread.
+        Uses a thread (not asyncio task) so it doesn't compete with the
+        agent's main event loop for the same httpx connection pool.
+        """
+        import threading
+        if not self.enabled:
+            log.warning("Telegram polling disabled (no credentials)")
+            return
+        if self._polling_thread and self._polling_thread.is_alive():
+            log.warning("Polling already running")
+            return
+        self._stop_polling.clear()
+        self._polling_thread = threading.Thread(
+            target=self._poll_thread_loop, daemon=True
+        )
+        self._polling_thread.start()
+        log.info("Telegram command polling started (thread)")
+
+    def stop_polling(self):
+        """Stop the background polling thread."""
+        self._stop_polling.set()
+        if self._polling_thread:
+            self._polling_thread.join(timeout=5)
+            self._polling_thread = None
+        log.info("Telegram command polling stopped")
+
+    def _poll_thread_loop(self):
+        """Thread-based long-poll for incoming messages.
+        Uses synchronous httpx to avoid interfering with the asyncio event loop.
+
+        Runs 20s long-polls, then immediately starts the next one. Per-request
+        clients avoid stale-connection issues; a `connect=5, read=25` timeout
+        ensures we never block longer than 25s even on a stuck server.
+        """
+        import httpx as sync_httpx
+        # Create the sync send client ONCE in this thread so it binds to
+        # this thread's loop/socket cleanly. Reusing a cross-loop client is
+        # what caused the intermittent "Event loop is closed" errors.
+        if self._sync_send_client is None:
+            self._sync_send_client = sync_httpx.Client(timeout=10.0)
+
+        url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
+        # No persistent Client — create per request to avoid stale-connection
+        # issues that can block long-polls indefinitely.
+        poll_count = 0
+        while not self._stop_polling.is_set():
+            client = None
+            try:
+                # Use fine-grained timeouts: 5s connect, 25s read.
+                # Telegram's long-poll holds the connection up to `timeout` seconds,
+                # so read=25 means we'll always get a response (or timeout) within 25s.
+                timeouts = sync_httpx.Timeout(connect=5.0, read=25.0, write=5.0, pool=5.0)
+                client = sync_httpx.Client(timeout=timeouts)
+                r = client.get(
+                    url,
+                    params={"timeout": 20, "offset": self._offset, "allowed_updates": '["message"]'},
+                )
+                poll_count += 1
+                if r.status_code != 200:
+                    log.warning(f"getUpdates failed ({r.status_code})")
+                    self._stop_polling.wait(2)
+                    continue
+                data = r.json()
+                msgs = data.get("result", [])
+                if msgs:
+                    log.info(f"Polled #{poll_count}: {len(msgs)} new message(s)")
+                for update in msgs:
+                    self._offset = max(self._offset, update["update_id"] + 1)
+                    self._handle_update_sync(update)
+            except Exception as e:
+                log.error(f"Polling error: {e}")
+                self._stop_polling.wait(2)
+            finally:
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+
+    def _handle_update_sync(self, update: Dict[str, Any]):
+        """Synchronous version of update handler for thread use.
+        Uses sync httpx to avoid asyncio event loop issues.
+        """
+        import httpx as sync_httpx
+        msg = update.get("message") or {}
+        text = (msg.get("text") or "").strip()
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+
+        log.info(f"📩 Received message: {text!r} from chat {chat_id}")
+
+        if chat_id != str(self.chat_id):
+            log.debug(f"Ignoring message from chat {chat_id}")
+            return
+
+        if not text.startswith("/"):
+            return
+
+        parts = text.split(maxsplit=1)
+        cmd = parts[0].lstrip("/").split("@")[0].lower()
+        args = parts[1] if len(parts) > 1 else ""
+
+        log.info(f"⚡ Processing command: /{cmd} args={args!r}")
+
+        handler = self._command_handlers.get(cmd)
+        if not handler:
+            log.info(f"Unknown command: /{cmd}")
+            self._send_sync(f"❓ Unknown command: /{cmd}\nType /help for available commands.")
+            return
+
+        # Run the async handler in a fresh event loop
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                response = loop.run_until_complete(handler(args))
+            finally:
+                loop.close()
+            log.info(f"📤 Sending response for /{cmd} ({len(response)} chars)")
+            self._send_sync(response)
+        except Exception as e:
+            log.error(f"Command /{cmd} failed: {e}", exc_info=True)
+            self._send_sync(f"⚠️ Error handling /{cmd}: {e}")
+
+    def _send_sync(self, text: str) -> bool:
+        """Synchronous send used by the polling thread."""
+        import httpx as sync_httpx
+        if self._sync_send_client is None:
+            self._sync_send_client = sync_httpx.Client(timeout=10.0)
+        if not self.enabled:
+            log.info(f"[MOCK TELEGRAM] Would send:\n{text}\n")
+            return True
+        try:
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            r = self._sync_send_client.post(url, json={
+                "chat_id": self.chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            })
+            if r.status_code != 200:
+                log.error(f"Telegram send failed ({r.status_code}): {r.text[:200]}")
+                return False
+            return True
+        except Exception as e:
+            log.error(f"Telegram send failed: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Lifecycle helpers
+    # ------------------------------------------------------------------
+    def pause(self):
+        self._paused = True
+        log.info("Alerts paused")
+
+    def resume(self):
+        self._paused = False
+        log.info("Alerts resumed")
+
+    def is_paused(self) -> bool:
+        return self._paused
+
+    def _log_to_file(self, verdict: Verdict, text: str):
+        with open(ALERTS_LOG, "a") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"{datetime.utcnow().isoformat()}Z\n")
+            f.write(json.dumps({
+                "tier": verdict.tier.value,
+                "symbol": verdict.symbol,
+                "address": verdict.token_address,
+                "score": verdict.score,
+                "strategy": verdict.strategy,
+            }, indent=2) + "\n")
+            f.write(text + "\n")
+
+    async def close(self):
+        self.stop_polling()
+        await self._client.aclose()
+        await self._poll_client.aclose()
+        if self._sync_send_client:
+            self._sync_send_client.close()
