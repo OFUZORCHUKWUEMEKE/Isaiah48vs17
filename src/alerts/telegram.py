@@ -152,22 +152,15 @@ class TelegramAlerter:
         ensures we never block longer than 25s even on a stuck server.
         """
         import httpx as sync_httpx
-        # Create the sync send client ONCE in this thread so it binds to
-        # this thread's loop/socket cleanly. Reusing a cross-loop client is
-        # what caused the intermittent "Event loop is closed" errors.
         if self._sync_send_client is None:
             self._sync_send_client = sync_httpx.Client(timeout=10.0)
 
         url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
-        # No persistent Client — create per request to avoid stale-connection
-        # issues that can block long-polls indefinitely.
         poll_count = 0
+        consecutive_errors = 0
         while not self._stop_polling.is_set():
             client = None
             try:
-                # Use fine-grained timeouts: 5s connect, 25s read.
-                # Telegram's long-poll holds the connection up to `timeout` seconds,
-                # so read=25 means we'll always get a response (or timeout) within 25s.
                 timeouts = sync_httpx.Timeout(connect=5.0, read=25.0, write=5.0, pool=5.0)
                 client = sync_httpx.Client(timeout=timeouts)
                 r = client.get(
@@ -175,10 +168,21 @@ class TelegramAlerter:
                     params={"timeout": 20, "offset": self._offset, "allowed_updates": '["message"]'},
                 )
                 poll_count += 1
+                if r.status_code == 409:
+                    # Conflict: another bot instance is using getUpdates.
+                    # Skip the current message batch and bump offset to catch up.
+                    log.warning("getUpdates 409 conflict — another session is polling. Skipping ahead.")
+                    data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                    next_offset = data.get("parameters", {}).get("retry_after", 0) or (self._offset + 1)
+                    self._offset = max(self._offset + 1, next_offset)
+                    self._stop_polling.wait(5)
+                    continue
                 if r.status_code != 200:
                     log.warning(f"getUpdates failed ({r.status_code})")
-                    self._stop_polling.wait(2)
+                    consecutive_errors += 1
+                    self._stop_polling.wait(min(30, 2 ** consecutive_errors))
                     continue
+                consecutive_errors = 0  # reset on success
                 data = r.json()
                 msgs = data.get("result", [])
                 if msgs:
@@ -186,9 +190,13 @@ class TelegramAlerter:
                 for update in msgs:
                     self._offset = max(self._offset, update["update_id"] + 1)
                     self._handle_update_sync(update)
+                # Heartbeat: log every 10 successful polls so we can see it's alive
+                if poll_count % 10 == 0:
+                    log.debug(f"Polling alive: {poll_count} polls, offset={self._offset}")
             except Exception as e:
                 log.error(f"Polling error: {e}")
-                self._stop_polling.wait(2)
+                consecutive_errors += 1
+                self._stop_polling.wait(min(30, 2 ** consecutive_errors))
             finally:
                 if client is not None:
                     try:
