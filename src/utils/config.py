@@ -26,13 +26,16 @@ def load_config() -> Dict[str, Any]:
     if mode:
         cfg["mode"] = mode
 
-    # Inject API keys
+    # Inject API keys (strip whitespace/newlines from env vars)
+    def _env(name: str, default: str = "") -> str:
+        return os.getenv(name, default).strip()
+
     cfg["_env"] = {
-        "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
-        "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
-        "helius_api_key": os.getenv("HELIUS_API_KEY", ""),
-        "birdeye_api_key": os.getenv("BIRDEYE_API_KEY", ""),
-        "log_level": os.getenv("LOG_LEVEL", "INFO"),
+        "telegram_bot_token": _env("TELEGRAM_BOT_TOKEN"),
+        "telegram_chat_id": _env("TELEGRAM_CHAT_ID"),
+        "helius_api_key": _env("HELIUS_API_KEY"),
+        "birdeye_api_key": _env("BIRDEYE_API_KEY"),
+        "log_level": _env("LOG_LEVEL", "INFO"),
     }
 
     return cfg

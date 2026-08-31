@@ -213,10 +213,10 @@ class TelegramAlerter:
         text = (msg.get("text") or "").strip()
         chat_id = str(msg.get("chat", {}).get("id", ""))
 
-        log.info(f"📩 Received message: {text!r} from chat {chat_id}")
+        log.info(f"📩 Received message: {text!r} from chat {chat_id!r} (configured: {self.chat_id!r})")
 
         if chat_id != str(self.chat_id):
-            log.debug(f"Ignoring message from chat {chat_id}")
+            log.warning(f"Chat ID mismatch: got {chat_id!r}, expected {self.chat_id!r}. Ignoring.")
             return
 
         if not text.startswith("/"):
