@@ -374,7 +374,9 @@ class WalletScorer:
 
         if to_score:
             log.info(f"Scoring {len(to_score)} wallets ({len(wallets) - len(to_score)} cached)...")
-            # Serial scoring with delay (Helius rate limit friendly)
+            failed = 0
+            # Serial scoring. Pacing is enforced inside the Helius client so
+            # this stays correct even when another caller is running too.
             for i, w in enumerate(to_score):
                 try:
                     metrics = await self.score_wallet(w)
@@ -383,8 +385,19 @@ class WalletScorer:
                         log.info(f"  scored {i + 1}/{len(to_score)}")
                     await asyncio.sleep(0.15)
                 except Exception as e:
+                    failed += 1
                     log.error(f"Score failed for {w[:8]}: {e}")
-                    self._scores[w] = self._default_score(w, reason=f"error: {e}")
+                    # Keep any score we already had. Overwriting it with a
+                    # 30/tier-3 placeholder poisons _assign_tiers, which ranks
+                    # by percentile - a batch of failures (e.g. a rate-limit
+                    # burst) would otherwise silently reshuffle every tier.
+                    if w not in self._scores:
+                        self._scores[w] = self._default_score(w, reason=f"error: {e}")
+            if failed:
+                log.warning(
+                    f"{failed}/{len(to_score)} wallets failed to score; "
+                    "kept previous scores where available"
+                )
             self._save_cache()
             self._last_full_run = now
 

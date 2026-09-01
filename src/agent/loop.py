@@ -406,7 +406,10 @@ class MemecoinAgent:
             self._wallet_cache_time[wallet] = time.time()
         except Exception as e:
             log.debug(f"Wallet {wallet[:8]} fetch failed: {e}")
-            # Don't update cache on failure - we'll retry next time
+            # Don't update cache on failure - we'll retry next time.
+            # This only works because the client raises on failure; when it
+            # returned [] instead, a failed fetch was cached as "no buys" and
+            # the wallet's signal went silently missing until the TTL expired.
 
     def _rebuild_recent_buys(self):
         """Build the mint -> wallet map and per-tier buy map from cached transactions."""

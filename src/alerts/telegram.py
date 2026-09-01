@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -22,6 +23,11 @@ log = get_logger("telegram")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ALERTS_LOG = PROJECT_ROOT / "data" / "alerts.log"
+
+# How long the polling thread waits for a command before replying "still
+# running" and moving on. A full /wallets rescore over 200+ wallets is the
+# slowest command and needs generous headroom.
+COMMAND_TIMEOUT_SECONDS = 240
 
 
 class TelegramAlerter:
@@ -41,6 +47,10 @@ class TelegramAlerter:
         self._polling_thread = None
         self._stop_polling = __import__('threading').Event()
         self._offset = 0
+        # The agent's event loop, captured when polling starts. Command
+        # handlers are submitted back onto it rather than run on a throwaway
+        # loop, because they touch httpx clients that are bound to it.
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
         # Last reply context for commands that need richer data
         self._ctx: Dict[str, Any] = {}
 
@@ -128,6 +138,17 @@ class TelegramAlerter:
         if self._polling_thread and self._polling_thread.is_alive():
             log.warning("Polling already running")
             return
+        try:
+            self._main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Started outside a running loop (tests, CLI one-shots). Handlers
+            # fall back to asyncio.run(), which is fine as long as nothing
+            # else is using the shared clients concurrently.
+            self._main_loop = None
+            log.warning(
+                "start_polling() called with no running event loop - "
+                "commands will run on a temporary loop"
+            )
         self._stop_polling.clear()
         self._polling_thread = threading.Thread(
             target=self._poll_thread_loop, daemon=True
@@ -234,14 +255,30 @@ class TelegramAlerter:
             self._send_sync(f"❓ Unknown command: /{cmd}\nType /help for available commands.")
             return
 
-        # Run the async handler in a fresh event loop
+        # Submit the handler onto the agent's own event loop.
+        #
+        # Running it on a fresh loop here would break every shared
+        # httpx.AsyncClient: their connection pools hold asyncio primitives
+        # bound to the loop that created them, which surfaces as
+        # "<Event ...> is bound to a different event loop". It also let
+        # command work run *concurrently* with the scan loop, so two
+        # independent callers hammered the same rate-limited APIs.
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                response = loop.run_until_complete(handler(args))
-            finally:
-                loop.close()
+            if self._main_loop is not None and not self._main_loop.is_closed():
+                future = asyncio.run_coroutine_threadsafe(handler(args), self._main_loop)
+                try:
+                    response = future.result(timeout=COMMAND_TIMEOUT_SECONDS)
+                except FuturesTimeoutError:
+                    # The coroutine keeps running on the agent loop; we just
+                    # stop waiting so the poller isn't blocked indefinitely.
+                    log.warning(f"Command /{cmd} still running after {COMMAND_TIMEOUT_SECONDS}s")
+                    self._send_sync(
+                        f"⏳ /{cmd} is taking longer than {COMMAND_TIMEOUT_SECONDS}s. "
+                        "It's still running — check back shortly."
+                    )
+                    return
+            else:
+                response = asyncio.run(handler(args))
             log.info(f"📤 Sending response for /{cmd} ({len(response)} chars)")
             self._send_sync(response)
         except Exception as e:
