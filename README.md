@@ -213,14 +213,19 @@ Railway keeps the bot running 24/7 with auto-restart on crash, a health check en
 
 4. **Set environment variables** in Railway dashboard → Variables:
    ```
-   TELEGRAM_BOT_TOKEN = 8450699134:AAEJTT_UE29NOhjJFYADcbNa2lP3AHSWWSk
-   TELEGRAM_CHAT_ID  = 5384395418
-   HELIUS_API_KEY     = 1ecf6d0f-bd66-4e41-9e97-c424fe872828
-   BIRDEYE_API_KEY    = 1fc52bd2a9b041b998cdf60a7ece3b13
+   TELEGRAM_BOT_TOKEN = <your-bot-token-from-@BotFather>
+   TELEGRAM_CHAT_ID   = <your-numeric-chat-id>
+   HELIUS_API_KEY     = <your-helius-key>
+   BIRDEYE_API_KEY    = <your-birdeye-key>
    AGENT_MODE         = paper
    LOG_LEVEL          = INFO
    ```
-   ⚠️ **Do not put these in code or commit them to git.** They're stored encrypted in Railway's vault.
+   ⚠️ **Do not put real values in code, in this README, or anywhere in git.**
+   Enter them only in the Railway dashboard, where they're stored encrypted.
+   Keep local values in `.env` (already gitignored) — see `.env.example`.
+   If a credential is ever committed, rotate it immediately: revoking the
+   Telegram token via `@BotFather` → `/revoke` is the only thing that
+   actually invalidates it. Removing it from git does not.
 
 5. **Deploy**: Railway auto-detects `Procfile` and `railway.json`, builds with Nixpacks, and starts the bot.
 
