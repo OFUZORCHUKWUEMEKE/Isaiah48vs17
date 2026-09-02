@@ -85,11 +85,23 @@ class WalletScorer:
     # Single-wallet analysis
     # ------------------------------------------------------------------
     async def score_wallet(self, wallet: str) -> Dict[str, Any]:
-        """Compute metrics for one wallet. Returns dict with score, tier, components."""
+        """Compute metrics for one wallet. Returns dict with score, tier, components.
+
+        Helius.get_wallet_transactions() raises HeliusError on failure
+        (per the contract change in PR #2). We catch it here and fall
+        back to a neutral default so a single bad fetch doesn't tank
+        the whole scoring pass.
+        """
         if "MOCK" in wallet or "REPLACE" in wallet:
             return self._default_score(wallet, reason="mock_wallet")
 
-        txs = await self.helius.get_wallet_transactions(wallet, limit=100)
+        from src.data.helius import HeliusError
+        try:
+            txs = await self.helius.get_wallet_transactions(wallet, limit=100)
+        except HeliusError as e:
+            log.warning(f"HeliusError scoring {wallet[:8]}: {e}")
+            return self._default_score(wallet, reason=f"helius_error")
+
         if not txs:
             return self._default_score(wallet, reason="no_transactions")
 
