@@ -65,9 +65,16 @@ class MemecoinAgent:
             starting_capital=10_000.0,
             position_pct=config["rules"].get("portfolio_risk", {}).get("max_position_pct_of_capital", 5.0),
         )
-        # Wallet scorer — assigns Tier 1/2/3 based on win rate + ROI + recency
+        # Wallet scorer — assigns Tier 1/2/3 based on win rate + ROI + recency.
+        # Stage 6: pass the GMGN client only when it's actually usable
+        # (flag + real key, same self.gmgn_enabled every other GMGN-gated
+        # method here checks) - the scorer itself doesn't re-derive that
+        # decision, it just scores on-chain-only when given None.
         from src.agent.wallet_scorer import WalletScorer
-        self.scorer = WalletScorer(self.helius)
+        self.scorer = WalletScorer(
+            self.helius,
+            gmgn_client=self.gmgn if self.gmgn_enabled else None,
+        )
 
         self.tracked_wallets: List[str] = config.get("tracked_wallets", [])
         self._tracked_wallets_set = set(self.tracked_wallets)
