@@ -53,25 +53,26 @@ def cmd_once(args):
     agent = MemecoinAgent(cfg)
 
     async def one():
-        # Same discovery path _scan_cycle uses (GMGN primary + DexScreener
-        # merge if enabled+keyed, else DexScreener alone) - see
-        # MemecoinAgent._discover_runners. Calling agent.dex directly here
-        # would bypass it the same way the old enrichment call did before
-        # that was fixed in stage 2 (PR #5).
+        # Same discovery + evaluation path _scan_cycle uses (GMGN primary
+        # discovery, enrichment, momentum filter, real K-line indicators
+        # for survivors, rules, wallet-tier boost) - see
+        # MemecoinAgent._discover_runners and _evaluate_candidates. Calling
+        # agent.dex or agent._enrich directly here, or hand-rolling the
+        # evaluation steps, would bypass whichever of those the real cycle
+        # does - which is exactly the class of bug that made this need
+        # fixing twice already, once per stage (stage 2: PR #5's enrichment
+        # call; stage 3: PR #6's discovery call and a missing enrichment
+        # guard).
+        #
+        # This does mean cmd_once now applies the momentum filter and
+        # wallet-tier boost too, which the old hand-rolled version did not:
+        # a token that would never reach evaluate() during a real scan
+        # cycle no longer gets printed here either - matching what
+        # "run a single scan cycle" actually implies.
         runners = await agent._discover_runners()
         log.info(f"Found {len(runners)} runners")
-        for token in runners[:10]:
-            # Same enrichment decision _scan_cycle uses, including the
-            # "already have it" guard: a GMGN-discovered token already
-            # carries top10_pct from the rank response (that's the point
-            # of stage 3 - see _discover_runners), so re-enriching it here
-            # would waste a live API call and could only ever leave the
-            # value unchanged anyway (enrich_token only setdefaults on
-            # failure). See MemecoinAgent._enrich.
-            if "top10_pct" not in token:
-                token = await agent._enrich(token)
-            token.setdefault("pro_traders", 50)
-            verdict = agent.engine.evaluate(token)
+        verdicts = await agent._evaluate_candidates(runners[:10])
+        for verdict in verdicts:
             print("\n" + verdict.to_alert())
         await agent._shutdown()
     asyncio.run(one())
