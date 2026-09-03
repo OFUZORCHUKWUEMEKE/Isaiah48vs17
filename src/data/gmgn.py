@@ -259,6 +259,90 @@ class GMGNClient:
             log.error(f"GMGN get_rank failed: {e}")
             return []
 
+    def _normalize_rank_item(self, item: Dict[str, Any], interval: str) -> Dict[str, Any]:
+        """Convert one /v1/market/rank item into the shared token-dict shape
+        DexScreener._normalize() also produces, so a GMGN-sourced candidate
+        can flow through momentum filtering and evaluate() unmodified.
+
+        CAVEAT: the exact field name for the token address on a rank item
+        is not confirmed against a live response (same unverified-API
+        caveat as the rest of this module - see the module docstring and
+        docs/gmgn-integration-plan.md). Falls back across a few plausible
+        names rather than assuming one.
+
+        `interval` is whatever rank_interval the caller queried GMGN with.
+        swaps/buys/sells describe that single window, not "5m" and "1h"
+        simultaneously - only the txns_* keys matching that window are
+        populated here. The discovery step in loop.py merges in DexScreener
+        afterward to fill the other window for tokens both sources saw.
+        """
+        addr = item.get("address") or item.get("token_address") or item.get("base_address") or ""
+        buys = item.get("buys", 0) or 0
+        sells = item.get("sells", 0) or 0
+        mcap = item.get("market_cap", 0) or 0
+        fdv = item.get("fdv", mcap) or mcap
+        smart = (item.get("smart_degen_count") or 0) + (item.get("renowned_count") or 0)
+
+        token: Dict[str, Any] = {
+            "address": addr,
+            "symbol": item.get("symbol", "?"),
+            "name": item.get("name", item.get("symbol", "?")),
+            "chain": self.chain,
+            "dex": "gmgn",
+            "price_usd": item.get("price", 0) or 0,
+            "mcap_usd": mcap,
+            "fdv_usd": fdv,
+            "liquidity_usd": item.get("liquidity", 0) or 0,
+            "fdv_mcap_ratio": (fdv / mcap) if mcap else 0,
+            "holder_count": item.get("holder_count", 0) or 0,
+            # Holder/security/smart-money - GMGN's actual value-add over
+            # DexScreener. Rates already converted 0-1 -> 0-100 here, same
+            # conversion as enrich_token(), so this dict needs no further
+            # enrichment pass (loop.py's `if "top10_pct" not in token`
+            # guard skips it for these tokens - see docs/gmgn-integration-plan.md #4).
+            "top10_pct": (item.get("top_10_holder_rate") or 0) * 100,
+            "insider_pct": (item.get("suspected_insider_hold_rate") or 0) * 100,
+            "bundle_pct": (item.get("bundler_rate", item.get("bundler_trader_amount_rate", 0)) or 0) * 100,
+            "dev_hold_pct": (item.get("dev_team_hold_rate") or 0) * 100,
+            "pro_traders": smart,
+            "rug_ratio": item.get("rug_ratio", 0) or 0,
+            "is_wash_trading": bool(item.get("is_wash_trading", False)),
+            "creator_token_status": item.get("creator_token_status", ""),
+            "gmgn_source": True,
+        }
+
+        if interval == "5m":
+            token["volume_5m_usd"] = item.get("volume", 0) or 0
+            token["buy_sell_ratio_m5"] = (buys / sells) if sells else float(buys)
+        elif interval == "1h":
+            token["volume_1h_usd"] = item.get("volume", 0) or 0
+            token["txns_1h_buys"] = buys
+            token["txns_1h_sells"] = sells
+        else:
+            # Other intervals (1m/6h/24h/...): stash under their own key
+            # rather than mislabeling as a 5m or 1h figure the engine reads.
+            token[f"volume_{interval}_usd"] = item.get("volume", 0) or 0
+
+        return token
+
+    async def get_discovery_candidates(self, **filters: Any) -> List[Dict[str, Any]]:
+        """get_rank() + normalization into the shared token-dict shape.
+
+        This is what loop.py's discovery step calls. get_rank() itself
+        stays available unnormalized for raw API access (e.g. a future
+        /trending command that wants to show GMGN's own field names).
+        """
+        interval = str(filters.get("interval", "5m"))
+        items = await self.get_rank(**filters)
+        out = []
+        for item in items:
+            token = self._normalize_rank_item(item, interval)
+            if token.get("address"):
+                out.append(token)
+            else:
+                log.debug("GMGN rank item had no recognizable address field, skipped")
+        return out
+
     async def get_token_info(self, address: str) -> Dict[str, Any]:
         if self.mock_mode or "MOCK" in address:
             return self._mock_token_info(address)

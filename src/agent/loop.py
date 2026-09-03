@@ -192,6 +192,63 @@ class MemecoinAgent:
             return await self.gmgn.enrich_token(token)
         return await self.birdeye.enrich_token(token)
 
+    async def _discover_runners(self) -> List[Dict[str, Any]]:
+        """Get Solana runner candidates for this cycle.
+
+        When gmgn_enabled, GMGN's /v1/market/rank is the primary source -
+        one request returns up to rank_limit candidates that already carry
+        holder/security/smart-money fields (GMGNClient._normalize_rank_item).
+        That is what collapses the old per-token Birdeye enrichment fan-out:
+        the `if "top10_pct" not in token` guard in _scan_cycle skips
+        enrichment entirely for these, since it's already there. DexScreener
+        is still queried and merged in via setdefault (so it can never
+        clobber a GMGN field) to fill whichever price-change/txns fields
+        GMGN's single --interval didn't cover, for any address both
+        sources saw.
+
+        Falls back to DexScreener alone - identical to the pre-stage-3
+        behavior - when GMGN is disabled, unkeyed, or its rank call fails
+        outright. A single failed discovery call should degrade the agent
+        for one cycle, not crash it or leave it with zero candidates.
+        """
+        dex_runners = await self.dex.get_solana_runners(
+            min_volume_5m=30_000,
+            limit=self.cfg["scanning"]["dexscreener_search_limit"],
+        )
+
+        if not self.gmgn_enabled:
+            return dex_runners
+
+        g = self.cfg.get("gmgn", {})
+        gmgn_candidates = await self.gmgn.get_discovery_candidates(
+            interval=g.get("rank_interval", "5m"),
+            limit=g.get("rank_limit", 100),
+            order_by=g.get("rank_order_by", "volume"),
+            min_liquidity=g.get("min_liquidity_usd", 20000),
+            max_rug_ratio=g.get("max_rug_ratio", 0.30),
+            min_created=g.get("min_created", "30m"),
+        )
+        if not gmgn_candidates:
+            log.debug("GMGN rank returned no candidates this cycle; using DexScreener alone")
+            return dex_runners
+
+        by_address = {t["address"]: t for t in gmgn_candidates}
+        dex_by_address = {t["address"]: t for t in dex_runners if t.get("address")}
+
+        for addr, dex_token in dex_by_address.items():
+            if addr in by_address:
+                for k, v in dex_token.items():
+                    by_address[addr].setdefault(k, v)
+            else:
+                by_address[addr] = dex_token
+
+        merged = list(by_address.values())
+        log.info(
+            f"Discovery: {len(gmgn_candidates)} GMGN + {len(dex_runners)} DexScreener "
+            f"-> {len(merged)} merged candidates"
+        )
+        return merged
+
     async def force_scan(self) -> Dict[str, Any]:
         """Run a single scan cycle on demand (for /scan command)."""
         log.info("Force scan triggered by user")
@@ -289,11 +346,9 @@ class MemecoinAgent:
     async def _scan_cycle(self):
         """One full scan iteration."""
         try:
-            # 1. Get runner candidates from DexScreener
-            runners = await self.dex.get_solana_runners(
-                min_volume_5m=30_000,
-                limit=self.cfg["scanning"]["dexscreener_search_limit"],
-            )
+            # 1. Get runner candidates (GMGN primary when enabled, merged
+            # with DexScreener; DexScreener alone otherwise - see _discover_runners)
+            runners = await self._discover_runners()
             log.info(f"Found {len(runners)} Solana runners")
 
             # 2. Get pre-migration candidates from pump.fun
