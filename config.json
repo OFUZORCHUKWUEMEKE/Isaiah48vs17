@@ -10,6 +10,27 @@
     "dexscreener_search_limit": 50
   },
 
+  "gmgn": {
+    "_note": "Not yet wired into the scan loop - see docs/gmgn-integration-plan.md. This block only configures src/data/gmgn.py for when it is.",
+    "enabled": false,
+    "chain": "sol",
+    "base_url": "",
+    "transport": "auto",
+    "rank_interval": "5m",
+    "rank_limit": 100,
+    "rank_order_by": "volume",
+    "max_rug_ratio": 0.30,
+    "min_liquidity_usd": 20000,
+    "min_created": "30m",
+    "kline_resolution": "1m",
+    "kline_budget_per_cycle": 8,
+    "kline_lookback_candles": 60,
+    "fib_lookback_candles": 288,
+    "fib_tolerance": 0.02,
+    "feed_wallet_tier": 3,
+    "use_for_wallet_scoring": true
+  },
+
   "tracked_wallets": [
     "215nhcAHjQQGgwpQSJQ7zR26etbjjtVdW74NLzwEgQjP",
     "26kZ9rg8Y5pd4j1tdT4cbT8BQRu5uDbXkaVs3L5QasHy",
