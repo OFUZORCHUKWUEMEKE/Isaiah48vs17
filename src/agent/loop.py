@@ -26,6 +26,7 @@ from src.data.gmgn import GMGNClient
 from src.data.helius import Helius
 from src.data.pumpfun import PumpFun
 from src.rules.engine import RuleEngine, Verdict, Tier
+from src.rules.indicators import volume_metrics, fib_retracement
 from src.utils.config import load_config, has_real_credentials
 from src.utils.logger import get_logger
 
@@ -76,6 +77,11 @@ class MemecoinAgent:
         # Cache: which wallets we already checked recently (to avoid 429s on rapid restarts)
         self._wallet_cache: Dict[str, List[Dict]] = {}
         self._wallet_cache_time: Dict[str, float] = {}
+
+        # Cache: K-line candles per token address (GMGN only, stage 4).
+        # TTL'd separately from wallet caching - see _attach_kline_indicators.
+        self._kline_cache: Dict[str, List[Dict]] = {}
+        self._kline_cache_time: Dict[str, float] = {}
 
         self._seen_addresses: Set[str] = set()
         self._last_scan_at: float = 0.0
@@ -249,6 +255,134 @@ class MemecoinAgent:
         )
         return merged
 
+    async def _attach_kline_indicators(self, survivors: List[Dict[str, Any]]) -> None:
+        """Fetch real K-line data for tokens that survived the momentum
+        filter and attach volume_1m_usd/volume_15m_usd/volume_spike_ratio/
+        fib_retracement, mutating each token dict in place. This is what
+        actually fixes volume_spike_ratio being algebraically stuck at 5.0
+        (dexscreener.py's synthetic derivation) and fib_retracement being a
+        permanent 0 - see src/rules/indicators.py and
+        docs/gmgn-integration-plan.md #3-4.
+
+        No-op when gmgn_enabled is False, mirroring _enrich()'s and
+        _discover_runners()'s self-contained gating - callers don't need
+        to check the flag themselves.
+
+        Budget-limited: klines are the one remaining per-token GMGN call
+        (weight 2), so only up to kline_budget_per_cycle *new* fetches
+        happen per call - see the plan's "K-line budget" note. A cache hit
+        is free and doesn't count against the budget; once the budget is
+        exhausted, tokens without a fresh cache entry are simply skipped
+        for this call rather than the whole pass aborting.
+
+        volume_5m_usd is left alone (filled only via setdefault, never
+        overwritten) - it's already populated by discovery (GMGN rank or
+        DexScreener), and comparing kline-derived volume_1m_usd against
+        that already-trusted figure in check_volume_decay is more
+        consistent than replacing it with an independently-windowed sum
+        that could disagree with what discovery reported.
+        """
+        if not self.gmgn_enabled:
+            return
+
+        g = self.cfg.get("gmgn", {})
+        budget = g.get("kline_budget_per_cycle", 8)
+        resolution = g.get("kline_resolution", "1m")
+        lookback = g.get("kline_lookback_candles", 60)
+        fib_lookback = g.get("fib_lookback_candles", 288)
+        ttl = self.scan_interval
+
+        now = time.time()
+        fetched = 0
+        for token in survivors:
+            addr = token.get("address", "")
+            if not addr:
+                continue
+
+            cached = self._kline_cache.get(addr)
+            fresh = cached is not None and (now - self._kline_cache_time.get(addr, 0)) < ttl
+            if fresh:
+                candles = cached
+            elif fetched < budget:
+                candles = await self.gmgn.get_kline(addr, resolution=resolution)
+                self._kline_cache[addr] = candles
+                self._kline_cache_time[addr] = now
+                fetched += 1
+            else:
+                continue  # budget exhausted this call, no fresh cache - leave the token as-is
+
+            if not candles:
+                continue
+
+            vm = volume_metrics(candles, lookback=lookback)
+            token["volume_1m_usd"] = vm["volume_1m_usd"]
+            token["volume_15m_usd"] = vm["volume_15m_usd"]
+            token["volume_spike_ratio"] = vm["volume_spike_ratio"]
+            token.setdefault("volume_5m_usd", vm["volume_5m_usd"])
+            token["fib_retracement"] = fib_retracement(candles, lookback=fib_lookback)
+
+    async def _evaluate_candidates(self, candidates: List[Dict[str, Any]]) -> List[Verdict]:
+        """Turn raw discovery candidates into Verdicts: enrich, apply the
+        momentum filter, attach real K-line indicators for the survivors
+        (GMGN only), run the rule engine, and apply any tracked-wallet
+        tier boost.
+
+        Both _scan_cycle and bot.py's cmd_once call this - a single place
+        that decides how a candidate becomes a verdict, rather than two
+        copies of the same steps that can drift out of sync. That drift is
+        not hypothetical: cmd_once had to be fixed to match _scan_cycle
+        after both stage 2 (PR #5, the enrichment call) and stage 3
+        (PR #6, the discovery call and a missing enrichment guard) each
+        found it out of date in a different way.
+        """
+        survivors: List[Dict[str, Any]] = []
+        momentum_rejects = 0
+        for token in candidates:
+            if not token or not token.get("address"):
+                continue
+            # Enrich with holder data (GMGN if enabled+keyed, else Birdeye)
+            if "top10_pct" not in token:
+                token = await self._enrich(token)
+            # Add mock pro-trader data if not present
+            token.setdefault("pro_traders", 50)
+            token.setdefault("fib_retracement", 0)
+            # Apply momentum filter first (video 2.5: only active coins)
+            passes_mom, mom_failures = self.engine.passes_momentum_filter(token)
+            if not passes_mom:
+                momentum_rejects += 1
+                continue
+            survivors.append(token)
+        if momentum_rejects:
+            log.debug(f"Momentum filter rejected {momentum_rejects} candidate(s)")
+
+        # Real K-line indicators for the survivors (GMGN only; no-op otherwise)
+        await self._attach_kline_indicators(survivors)
+
+        verdicts: List[Verdict] = []
+        for token in survivors:
+            verdict = self.engine.evaluate(token)
+            # Upgrade tier based on WHICH tier of wallet(s) is buying.
+            # Tier 1 = strong Tier A boost (top 10% wallets)
+            # Tier 2 = moderate boost
+            # Tier 3 = light boost (current default behavior)
+            token_addr = token.get("address", "")
+            if token_addr in self._recent_buys_by_tier:
+                tiers_bought = self._recent_buys_by_tier[token_addr]
+                # Pick the BEST wallet that bought this token
+                best_wallet = None
+                best_tier = 3
+                for mint, wallet in self._recent_wallet_buys.items():
+                    if mint == token_addr:
+                        t = self.scorer.get_tier(wallet)
+                        if t < best_tier:
+                            best_tier = t
+                            best_wallet = wallet
+                if best_wallet:
+                    verdict = self.engine.apply_wallet_signal(verdict, best_wallet, tier=best_tier)
+                    verdict.data["wallet_tiers"] = sorted(tiers_bought)
+            verdicts.append(verdict)
+        return verdicts
+
     async def force_scan(self) -> Dict[str, Any]:
         """Run a single scan cycle on demand (for /scan command)."""
         log.info("Force scan triggered by user")
@@ -362,46 +496,11 @@ class MemecoinAgent:
                 await self._check_tracked_wallets()
                 self._last_wallet_check = now
 
-            # 4. Evaluate all candidates
+            # 4. Evaluate all candidates (enrich, momentum-filter, attach
+            # real K-line indicators for survivors, apply rules, wallet-tier
+            # boost - see _evaluate_candidates)
             all_candidates = runners + pf_coins
-            verdicts: List[Verdict] = []
-            momentum_rejects = 0
-            for token in all_candidates:
-                if not token or not token.get("address"):
-                    continue
-                # Enrich with holder data (GMGN if enabled+keyed, else Birdeye)
-                if "top10_pct" not in token:
-                    token = await self._enrich(token)
-                # Add mock pro-trader data if not present
-                token.setdefault("pro_traders", 50)
-                token.setdefault("fib_retracement", 0)
-                # Apply momentum filter first (video 2.5: only active coins)
-                passes_mom, mom_failures = self.engine.passes_momentum_filter(token)
-                if not passes_mom:
-                    momentum_rejects += 1
-                    continue
-                # Apply rules
-                verdict = self.engine.evaluate(token)
-                # Upgrade tier based on WHICH tier of wallet(s) is buying.
-                # Tier 1 = strong Tier A boost (top 10% wallets)
-                # Tier 2 = moderate boost
-                # Tier 3 = light boost (current default behavior)
-                token_addr = token.get("address", "")
-                if token_addr in self._recent_buys_by_tier:
-                    tiers_bought = self._recent_buys_by_tier[token_addr]
-                    # Pick the BEST wallet that bought this token
-                    best_wallet = None
-                    best_tier = 3
-                    for mint, wallet in self._recent_wallet_buys.items():
-                        if mint == token_addr:
-                            t = self.scorer.get_tier(wallet)
-                            if t < best_tier:
-                                best_tier = t
-                                best_wallet = wallet
-                    if best_wallet:
-                        verdict = self.engine.apply_wallet_signal(verdict, best_wallet, tier=best_tier)
-                        verdict.data["wallet_tiers"] = sorted(tiers_bought)
-                verdicts.append(verdict)
+            verdicts = await self._evaluate_candidates(all_candidates)
 
             # 5. Sort by tier then score
             verdicts.sort(key=lambda v: (v.tier.value, v.score), reverse=True)

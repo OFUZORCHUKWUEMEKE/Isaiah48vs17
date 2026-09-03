@@ -11,7 +11,7 @@
   },
 
   "gmgn": {
-    "_note": "Wired for enrichment (stage 2) and discovery (stage 3) - see docs/gmgn-integration-plan.md. Stays inactive with enabled=false; flipping this to true ALSO needs a real GMGN_API_KEY (agent/loop.py requires both). rank_interval/rank_limit/rank_order_by/max_rug_ratio/min_liquidity_usd/min_created feed GMGNClient.get_discovery_candidates() directly; kline_* and fib_* keys are unused until stage 4.",
+    "_note": "Wired for enrichment (stage 2), discovery (stage 3), and K-line indicators (stage 4) - see docs/gmgn-integration-plan.md. Stays inactive with enabled=false; flipping this to true ALSO needs a real GMGN_API_KEY (agent/loop.py requires both). rank_interval/rank_limit/rank_order_by/max_rug_ratio/min_liquidity_usd/min_created feed GMGNClient.get_discovery_candidates() directly; kline_resolution/kline_budget_per_cycle/kline_lookback_candles/fib_lookback_candles feed MemecoinAgent._attach_kline_indicators(). fib_tolerance moved to rules.pullback_trading (it's a scoring parameter the engine reads, not a kline-fetch parameter this module cares about).",
     "enabled": false,
     "chain": "sol",
     "base_url": "",
@@ -26,7 +26,6 @@
     "kline_budget_per_cycle": 8,
     "kline_lookback_candles": 60,
     "fib_lookback_candles": 288,
-    "fib_tolerance": 0.02,
     "feed_wallet_tier": 3,
     "use_for_wallet_scoring": true
   },
@@ -267,6 +266,7 @@
       "min_mcap_usd": 100000,
       "min_5m_volume_usd": 30000,
       "fib_entry_levels": [0.50, 0.618, 0.786],
+      "fib_tolerance": 0.02,
       "stop_loss_pct": -20.0,
       "take_profit_pct": 100.0,
       "min_pro_traders": 5,
@@ -289,8 +289,9 @@
 
     "volume_decay_exit": {
       "enabled": true,
-      "min_5m_to_1m_ratio": 2.0,
-      "min_5m_to_15m_ratio": 0.70
+      "min_5m_to_1m_ratio": 0.5,
+      "min_5m_to_15m_ratio": 0.70,
+      "_note": "min_5m_to_1m_ratio was 2.0, calibrated against check_volume_decay's old (inverted) formula. The fixed formula (see engine.py) has a different scale: 1.0 means the last minute is trading exactly at the trailing 5m average rate, not the old formula's baseline-over-recent framing. Retuned to 0.5 (last minute must be at least half the 5m average, matching the already-correct min_5m_to_15m_ratio's 'recent must be >= X% of trailing average' philosophy at 70%, loosened for 1-minute noise) as a starting point pending live-data tuning - see docs/gmgn-integration-plan.md #3 and the min_pro_traders note in pullback_trading above for the same caveat."
     },
 
     "momentum_filter": {

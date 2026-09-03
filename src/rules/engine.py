@@ -202,8 +202,16 @@ class RuleEngine:
             score += 15
 
         # Fib retracement entry
+        # Tolerance-matched, not exact float equality: a real retracement
+        # computed from candle data (src/rules/indicators.py) essentially
+        # never lands exactly on 0.618. This branch was a permanent no-op
+        # against a real value until fixed - see docs/gmgn-integration-plan.md #3.
         fib_level = token.get("fib_retracement", 0)
-        if fib_level in cfg["fib_entry_levels"]:
+        fib_tolerance = cfg.get("fib_tolerance", 0.02)
+        near_fib_level = fib_level > 0 and any(
+            abs(fib_level - lvl) <= fib_tolerance for lvl in cfg["fib_entry_levels"]
+        )
+        if near_fib_level:
             reasons.append(f"Fib bounce at {fib_level:.3f}")
             score += 15
         elif fib_level > 0:
@@ -317,10 +325,23 @@ class RuleEngine:
         vol5m = token.get("volume_5m_usd", 0)
         vol15m = token.get("volume_15m_usd", 0)
 
-        if vol1m > 0:
-            ratio_5m_to_1m = vol5m / (vol1m * 5)  # normalize
-            if ratio_5m_to_1m < cfg["min_5m_to_1m_ratio"]:
-                return {"decaying": True, "reason": f"5m/1m = {ratio_5m_to_1m:.2f} < {cfg['min_5m_to_1m_ratio']}"}
+        # vol1m / (vol5m / 5): the most recent minute against the trailing
+        # 5-minute average rate. This was previously vol5m / (vol1m * 5) -
+        # the exact reciprocal - which inverted the direction: a hot final
+        # minute made vol1m large, drove the OLD ratio down, and got
+        # flagged as "decaying" (the opposite of the intent), while a
+        # genuinely cooling token (vol1m small) drove the old ratio up and
+        # was never flagged. See docs/gmgn-integration-plan.md #3. The
+        # 5m-vs-15m check just below was already oriented correctly
+        # (recent-over-baseline, not baseline-over-recent) and is untouched.
+        if vol1m > 0 and vol5m > 0:
+            ratio_1m_to_5m_avg = vol1m / (vol5m / 5)
+            if ratio_1m_to_5m_avg < cfg["min_5m_to_1m_ratio"]:
+                return {
+                    "decaying": True,
+                    "reason": f"1m ${vol1m:,.0f} vs 5m-avg ${vol5m / 5:,.0f} "
+                              f"= {ratio_1m_to_5m_avg:.2f}x < {cfg['min_5m_to_1m_ratio']}",
+                }
 
         if vol15m > 0:
             ratio_5m_to_15m = vol5m / (vol15m / 3)  # normalize 15m -> 5m baseline
