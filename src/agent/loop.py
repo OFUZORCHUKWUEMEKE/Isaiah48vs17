@@ -16,7 +16,7 @@ import os
 import re
 import signal
 import time
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Tuple
 
 from src.alerts.telegram import TelegramAlerter
 from src.agent.ledger import PaperLedger
@@ -70,6 +70,7 @@ class MemecoinAgent:
         self.scorer = WalletScorer(self.helius)
 
         self.tracked_wallets: List[str] = config.get("tracked_wallets", [])
+        self._tracked_wallets_set = set(self.tracked_wallets)
         self.scan_interval = config["scanning"]["scan_interval_seconds"]
         self.wallet_poll_interval = config["scanning"]["wallet_poll_interval_seconds"]
         self.daily_cap = config["scanning"]["daily_alert_cap"]
@@ -86,7 +87,13 @@ class MemecoinAgent:
         self._seen_addresses: Set[str] = set()
         self._last_scan_at: float = 0.0
         self._last_wallet_check = 0
-        self._recent_wallet_buys: Dict[str, str] = {}  # mint -> wallet
+        # mint -> [(wallet, tier), ...]. Was mint -> a single first-buyer
+        # wallet; that meant _evaluate_candidates's "pick the best wallet"
+        # search never had more than one candidate - a no-op. See the
+        # "prerequisite fix" note in docs/gmgn-integration-plan.md #5,
+        # needed before a second signal source (the GMGN wallet feed,
+        # stage 5) could contribute anything real.
+        self._recent_wallet_buys: Dict[str, List[Tuple[str, int]]] = {}
         # Track per-tier buys: mint -> set of tier labels
         self._recent_buys_by_tier: Dict[str, set] = {}  # mint -> {"T1", "T2", "T3"}
 
@@ -366,20 +373,20 @@ class MemecoinAgent:
             # Tier 2 = moderate boost
             # Tier 3 = light boost (current default behavior)
             token_addr = token.get("address", "")
-            if token_addr in self._recent_buys_by_tier:
-                tiers_bought = self._recent_buys_by_tier[token_addr]
-                # Pick the BEST wallet that bought this token
-                best_wallet = None
-                best_tier = 3
-                for mint, wallet in self._recent_wallet_buys.items():
-                    if mint == token_addr:
-                        t = self.scorer.get_tier(wallet)
-                        if t < best_tier:
-                            best_tier = t
-                            best_wallet = wallet
-                if best_wallet:
-                    verdict = self.engine.apply_wallet_signal(verdict, best_wallet, tier=best_tier)
-                    verdict.data["wallet_tiers"] = sorted(tiers_bought)
+            # Pick the BEST (lowest-numbered) wallet tier among everyone who
+            # bought this token, curated or GMGN-feed-sourced. The tier is
+            # read from the (wallet, tier) tuple captured when the buy was
+            # recorded (_rebuild_recent_buys / _check_gmgn_wallet_feed) -
+            # NOT re-derived here via scorer.get_tier(), because that would
+            # forget a feed-only wallet's configured feed_wallet_tier and
+            # silently fall back to the scorer's own (currently identical,
+            # but unrelated) default for unscored wallets.
+            buyers = self._recent_wallet_buys.get(token_addr)
+            if buyers:
+                best_wallet, best_tier = min(buyers, key=lambda wt: wt[1])
+                tiers_bought = self._recent_buys_by_tier.get(token_addr, set())
+                verdict = self.engine.apply_wallet_signal(verdict, best_wallet, tier=best_tier)
+                verdict.data["wallet_tiers"] = sorted(tiers_bought)
             verdicts.append(verdict)
         return verdicts
 
@@ -544,13 +551,21 @@ class MemecoinAgent:
         With 200+ wallets and Helius free-tier limits (~10 req/sec),
         we process serially with 0.12s between calls, and cache results
         for wallet_poll_interval seconds.
+
+        Ends by folding in the GMGN smart-money/KOL feed (stage 5) on top
+        of whatever the curated-wallet rebuild below produced - see
+        _check_gmgn_wallet_feed, which no-ops when gmgn_enabled is False.
+        That call happens on every exit path (no valid wallets, all
+        cached, or a fresh fetch) so the feed still gets polled on its own
+        schedule even when there's nothing for Helius to do this cycle.
         """
         valid_wallets = [
             w for w in self.tracked_wallets
             if "MOCK" not in w and "REPLACE" not in w
         ]
         if not valid_wallets:
-            log.debug("No real tracked wallets - skipping")
+            log.debug("No real tracked wallets - skipping Helius poll")
+            await self._check_gmgn_wallet_feed()
             return
 
         now = time.time()
@@ -564,6 +579,7 @@ class MemecoinAgent:
         ]
         if not wallets_to_fetch:
             self._rebuild_recent_buys()
+            await self._check_gmgn_wallet_feed()
             log.debug(f"All {len(valid_wallets)} wallets cached. "
                       f"Recent buys: {len(self._recent_wallet_buys)}")
             return
@@ -578,6 +594,7 @@ class MemecoinAgent:
             await asyncio.sleep(0.12)
 
         self._rebuild_recent_buys()
+        await self._check_gmgn_wallet_feed()
         log.info(f"Wallet check complete: {len(self._recent_wallet_buys)} recent buys from {len(valid_wallets)} wallets")
 
     async def _fetch_wallet_safe(self, wallet: str):
@@ -597,19 +614,24 @@ class MemecoinAgent:
             # the wallet's signal went silently missing until the TTL expired.
 
     def _rebuild_recent_buys(self):
-        """Build the mint -> wallet map and per-tier buy map from cached transactions."""
+        """Build the mint -> [(wallet, tier), ...] map and per-tier buy set
+        from cached Helius transactions for the curated tracked-wallet list.
+
+        Clears and fully rebuilds both structures from self._wallet_cache
+        every call - _check_gmgn_wallet_feed runs after this (never
+        before) and only adds on top, so the two sources compose into one
+        coherent window each poll rather than one wiping the other.
+        """
         now = time.time()
         lookback = self.cfg.get("rules", {}).get("wallet_signals", {}).get("wallet_lookback_minutes", 10) * 60
         cutoff = now - lookback
-        # mint -> first buyer wallet (kept for backward compat)
-        # mint -> set of tier labels that have bought
-        # mint -> list of (wallet, tier) tuples for the alert
         self._recent_wallet_buys.clear()
         self._recent_buys_by_tier.clear()
 
         for wallet, txs in self._wallet_cache.items():
             tier = self.scorer.get_tier(wallet)
             tier_label = f"T{tier}"
+            seen_mints_this_wallet = set()
             for tx in txs:
                 ts = tx.get("timestamp", 0)
                 if ts < cutoff:
@@ -619,14 +641,91 @@ class MemecoinAgent:
                     for change in token_changes:
                         if change.get("toUserAccount") == wallet:
                             mint = change.get("mint")
-                            if mint:
-                                # First buyer (for backward compat)
-                                if mint not in self._recent_wallet_buys:
-                                    self._recent_wallet_buys[mint] = wallet
-                                # Track tier presence
-                                if mint not in self._recent_buys_by_tier:
-                                    self._recent_buys_by_tier[mint] = set()
-                                self._recent_buys_by_tier[mint].add(tier_label)
+                            if mint and mint not in seen_mints_this_wallet:
+                                seen_mints_this_wallet.add(mint)
+                                self._recent_wallet_buys.setdefault(mint, []).append((wallet, tier))
+                                self._recent_buys_by_tier.setdefault(mint, set()).add(tier_label)
+
+    async def _check_gmgn_wallet_feed(self):
+        """Poll GMGN's smartmoney + KOL feeds and fold their buys into
+        _recent_wallet_buys / _recent_buys_by_tier on top of whatever
+        _rebuild_recent_buys() just built - does NOT clear those
+        structures, only adds to them (see that method's docstring for
+        why the ordering matters).
+
+        GMGN can't answer "which wallets bought token X" directly; it
+        exposes platform-wide feeds of recent trades by algorithmically-
+        identified smart money and tagged KOLs instead (see
+        docs/gmgn-integration-plan.md #5), so the mint -> wallet(s) map is
+        built by inverting them: keep only "buy" trades at or above
+        min_wallet_buy_usd within the lookback window, the same filters
+        _rebuild_recent_buys applies to Helius data and read from the
+        same rules.wallet_signals config block. side/min_amount_usd are
+        also passed to the feed calls as best-effort server-side filters
+        (unverified against a live API, same caveat as every other GMGN
+        route - see src/data/gmgn.py's module docstring); the client-side
+        filtering here is the actual source of truth regardless of
+        whether the server honors them.
+
+        A feed wallet that is ALSO on the curated tracked_wallets list
+        keeps its real WalletScorer-assigned tier, via the same
+        scorer.get_tier() lookup _rebuild_recent_buys uses. A feed-only
+        wallet gets gmgn.feed_wallet_tier (default 3) instead of relying
+        on WalletScorer's own default-to-3 behavior for unscored wallets,
+        because that default is incidental - it wouldn't track a
+        deliberately-configured feed_wallet_tier if someone changed it.
+        Deliberately tier 3, not something that could reach tier 1/2:
+        apply_wallet_signal only force-promotes tiers 1-2 to Tier A, and
+        mapping the whole platform-wide feed there would flood Tier A
+        alerts and drown out the curated list's entire point.
+
+        No-op when gmgn_enabled is False, matching every other GMGN-gated
+        method's self-contained gating (_enrich, _discover_runners,
+        _attach_kline_indicators).
+        """
+        if not self.gmgn_enabled:
+            return
+
+        wallet_cfg = self.cfg.get("rules", {}).get("wallet_signals", {})
+        min_buy_usd = wallet_cfg.get("min_wallet_buy_usd", 100)
+        lookback_s = wallet_cfg.get("wallet_lookback_minutes", 10) * 60
+        cutoff = time.time() - lookback_s
+        feed_tier = self.cfg.get("gmgn", {}).get("feed_wallet_tier", 3)
+
+        try:
+            smart, kol = await asyncio.gather(
+                self.gmgn.get_smartmoney_feed(side="buy", min_amount_usd=min_buy_usd),
+                self.gmgn.get_kol_feed(side="buy", min_amount_usd=min_buy_usd),
+            )
+        except Exception as e:
+            log.debug(f"GMGN wallet feed fetch failed: {e}")
+            return
+
+        added = 0
+        for entry in (smart or []) + (kol or []):
+            if entry.get("side") != "buy":
+                continue
+            if (entry.get("amount_usd") or 0) < min_buy_usd:
+                continue
+            ts = entry.get("timestamp", 0)
+            if ts < cutoff:
+                continue
+            mint = entry.get("base_address") or ""
+            wallet = entry.get("maker") or ""
+            if not mint or not wallet:
+                continue
+
+            tier = self.scorer.get_tier(wallet) if wallet in self._tracked_wallets_set else feed_tier
+            tier_label = f"T{tier}"
+
+            existing = self._recent_wallet_buys.setdefault(mint, [])
+            if not any(w == wallet for w, _ in existing):
+                existing.append((wallet, tier))
+                added += 1
+            self._recent_buys_by_tier.setdefault(mint, set()).add(tier_label)
+
+        if added:
+            log.info(f"GMGN wallet feed: {added} new buy signal(s) from smartmoney+KOL feeds")
 
     async def _shutdown(self):
         stats = self.ledger.stats()
