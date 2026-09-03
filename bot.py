@@ -34,6 +34,7 @@ def cmd_run(args):
     if getattr(args, "mock", False):
         cfg["_env"]["helius_api_key"] = ""
         cfg["_env"]["birdeye_api_key"] = ""
+        cfg["_env"]["gmgn_api_key"] = ""
         cfg["_env"]["telegram_bot_token"] = ""
         cfg["_env"]["telegram_chat_id"] = ""
         log.info("Forced MOCK mode for all APIs")
@@ -48,13 +49,16 @@ def cmd_once(args):
     if getattr(args, "mock", False):
         cfg["_env"]["helius_api_key"] = ""
         cfg["_env"]["birdeye_api_key"] = ""
+        cfg["_env"]["gmgn_api_key"] = ""
     agent = MemecoinAgent(cfg)
 
     async def one():
         runners = await agent.dex.get_solana_runners(limit=20)
         log.info(f"Found {len(runners)} runners")
         for token in runners[:10]:
-            token = await agent.birdeye.enrich_token(token)
+            # Same enrichment decision _scan_cycle uses (GMGN if enabled
+            # and keyed, else Birdeye) - see MemecoinAgent._enrich.
+            token = await agent._enrich(token)
             token.setdefault("pro_traders", 50)
             verdict = agent.engine.evaluate(token)
             print("\n" + verdict.to_alert())

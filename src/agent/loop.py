@@ -22,6 +22,7 @@ from src.alerts.telegram import TelegramAlerter
 from src.agent.ledger import PaperLedger
 from src.data.birdeye import Birdeye
 from src.data.dexscreener import DexScreener
+from src.data.gmgn import GMGNClient
 from src.data.helius import Helius
 from src.data.pumpfun import PumpFun
 from src.rules.engine import RuleEngine, Verdict, Tier
@@ -41,6 +42,19 @@ class MemecoinAgent:
         self.helius = Helius(api_key=env["helius_api_key"], mock_mode=not creds["helius"])
         self.birdeye = Birdeye(api_key=env["birdeye_api_key"], mock_mode=not creds["birdeye"])
         self.pumpfun = PumpFun(mock_mode=False)
+        gmgn_cfg = config.get("gmgn", {})
+        self.gmgn = GMGNClient(
+            api_key=env.get("gmgn_api_key", ""),
+            base_url=env.get("gmgn_base_url", ""),
+            chain=gmgn_cfg.get("chain", "sol"),
+            mock_mode=not creds["gmgn"],
+            transport=gmgn_cfg.get("transport", "auto"),
+        )
+        # Stage 2 of docs/gmgn-integration-plan.md: enrichment only, opt-in.
+        # Requires BOTH the config flag and a real key - gmgn.enabled=true
+        # with no key would otherwise silently run GMGN's own mock data
+        # through the live pipeline instead of falling back to Birdeye.
+        self.gmgn_enabled = bool(gmgn_cfg.get("enabled", False)) and creds["gmgn"]
         self.alerter = TelegramAlerter(
             bot_token=env["telegram_bot_token"],
             chat_id=env["telegram_chat_id"],
@@ -160,6 +174,23 @@ class MemecoinAgent:
         finally:
             summary_task.cancel()
             await self._shutdown()
+
+    async def _enrich(self, token: Dict[str, Any]) -> Dict[str, Any]:
+        """Add holder/insider/bundle data to a token dict.
+
+        GMGN is used only when gmgn.enabled is set in config AND a real
+        API key is configured (self.gmgn_enabled, computed in __init__).
+        Otherwise Birdeye is used, unchanged from before this method
+        existed - so with the shipped default (gmgn.enabled: false) this
+        is exactly the old `await self.birdeye.enrich_token(token)` call.
+
+        Both cmd_once (bot.py) and _scan_cycle call this so there is one
+        place that decides which source enriches a token, rather than two
+        copies of the same branch that can drift out of sync.
+        """
+        if self.gmgn_enabled:
+            return await self.gmgn.enrich_token(token)
+        return await self.birdeye.enrich_token(token)
 
     async def force_scan(self) -> Dict[str, Any]:
         """Run a single scan cycle on demand (for /scan command)."""
@@ -283,9 +314,9 @@ class MemecoinAgent:
             for token in all_candidates:
                 if not token or not token.get("address"):
                     continue
-                # Enrich with holder data
+                # Enrich with holder data (GMGN if enabled+keyed, else Birdeye)
                 if "top10_pct" not in token:
-                    token = await self.birdeye.enrich_token(token)
+                    token = await self._enrich(token)
                 # Add mock pro-trader data if not present
                 token.setdefault("pro_traders", 50)
                 token.setdefault("fib_retracement", 0)
@@ -460,6 +491,7 @@ class MemecoinAgent:
         await self.helius.close()
         await self.birdeye.close()
         await self.pumpfun.close()
+        await self.gmgn.close()
         await self.alerter.close()
 
 
