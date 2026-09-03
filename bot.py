@@ -53,12 +53,23 @@ def cmd_once(args):
     agent = MemecoinAgent(cfg)
 
     async def one():
-        runners = await agent.dex.get_solana_runners(limit=20)
+        # Same discovery path _scan_cycle uses (GMGN primary + DexScreener
+        # merge if enabled+keyed, else DexScreener alone) - see
+        # MemecoinAgent._discover_runners. Calling agent.dex directly here
+        # would bypass it the same way the old enrichment call did before
+        # that was fixed in stage 2 (PR #5).
+        runners = await agent._discover_runners()
         log.info(f"Found {len(runners)} runners")
         for token in runners[:10]:
-            # Same enrichment decision _scan_cycle uses (GMGN if enabled
-            # and keyed, else Birdeye) - see MemecoinAgent._enrich.
-            token = await agent._enrich(token)
+            # Same enrichment decision _scan_cycle uses, including the
+            # "already have it" guard: a GMGN-discovered token already
+            # carries top10_pct from the rank response (that's the point
+            # of stage 3 - see _discover_runners), so re-enriching it here
+            # would waste a live API call and could only ever leave the
+            # value unchanged anyway (enrich_token only setdefaults on
+            # failure). See MemecoinAgent._enrich.
+            if "top10_pct" not in token:
+                token = await agent._enrich(token)
             token.setdefault("pro_traders", 50)
             verdict = agent.engine.evaluate(token)
             print("\n" + verdict.to_alert())

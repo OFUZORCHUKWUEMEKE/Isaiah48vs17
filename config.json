@@ -11,7 +11,7 @@
   },
 
   "gmgn": {
-    "_note": "Not yet wired into the scan loop - see docs/gmgn-integration-plan.md. This block only configures src/data/gmgn.py for when it is.",
+    "_note": "Wired for enrichment (stage 2) and discovery (stage 3) - see docs/gmgn-integration-plan.md. Stays inactive with enabled=false; flipping this to true ALSO needs a real GMGN_API_KEY (agent/loop.py requires both). rank_interval/rank_limit/rank_order_by/max_rug_ratio/min_liquidity_usd/min_created feed GMGNClient.get_discovery_candidates() directly; kline_* and fib_* keys are unused until stage 4.",
     "enabled": false,
     "chain": "sol",
     "base_url": "",
@@ -255,11 +255,11 @@
       "max_top10_holder_pct": 40.0,
       "max_insider_pct": 35.0,
       "max_bundle_pct": 25.0,
-      "min_pro_traders": 40,
+      "min_pro_traders": 5,
       "take_profit_1_pct": 100.0,
       "take_profit_1_sell_pct": 50.0,
       "stop_loss_pct": -20.0,
-      "_note": "Disabled per video 2.5 (Sajad Flips): 'Stay well away from trenches. Crappy pump then completely dump.'"
+      "_note": "Disabled per video 2.5 (Sajad Flips): 'Stay well away from trenches. Crappy pump then completely dump.' min_pro_traders retuned 40->5 alongside pullback_trading's (see that block's note) even though this strategy is off, so it isn't miscalibrated again if it's ever re-enabled."
     },
 
     "pullback_trading": {
@@ -269,13 +269,14 @@
       "fib_entry_levels": [0.50, 0.618, 0.786],
       "stop_loss_pct": -20.0,
       "take_profit_pct": 100.0,
-      "min_pro_traders": 40,
+      "min_pro_traders": 5,
       "hold_hours": 5,
       "buy_sell_ratio_min": 1.5,
       "price_change_5m_min_pct": -30.0,
       "price_change_5m_max_pct": 50.0,
       "liquidity_floor_usd": 50000,
-      "_note": "Per video 2.5: skip MCAP<$100k (dead), target 2x in 4-6h, dip-buy 50-60% pullback"
+      "_note": "Per video 2.5: skip MCAP<$100k (dead), target 2x in 4-6h, dip-buy 50-60% pullback",
+      "_pro_traders_note": "min_pro_traders was 40, tuned against loop.py's old hardcoded pro_traders=50 default (always passed, never a real signal - see docs/gmgn-integration-plan.md). Retuned to 5 for when gmgn.enabled=true: real smart_degen_count+renowned_count from GMGN's /v1/market/rank runs single-digit to low-tens per that doc, not verified against live traffic (GMGN's API was unreachable from the dev environment throughout this integration). This is a starting point, not a calibrated value - watch alert volume after enabling and adjust. Harmless while gmgn.enabled stays false: the fallback path still hardcodes pro_traders=50, comfortably above 5."
     },
 
     "volume_spike": {
