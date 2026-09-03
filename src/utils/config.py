@@ -35,6 +35,8 @@ def load_config() -> Dict[str, Any]:
         "telegram_chat_id": _env("TELEGRAM_CHAT_ID"),
         "helius_api_key": _env("HELIUS_API_KEY"),
         "birdeye_api_key": _env("BIRDEYE_API_KEY"),
+        "gmgn_api_key": _env("GMGN_API_KEY"),
+        "gmgn_base_url": _env("GMGN_BASE_URL"),
         "log_level": _env("LOG_LEVEL", "INFO"),
     }
 
@@ -48,4 +50,5 @@ def has_real_credentials(cfg: Dict[str, Any]) -> Dict[str, bool]:
         "telegram": bool(env.get("telegram_bot_token") and env.get("telegram_chat_id")),
         "helius": bool(env.get("helius_api_key")),
         "birdeye": bool(env.get("birdeye_api_key")),
+        "gmgn": bool(env.get("gmgn_api_key")),
     }
