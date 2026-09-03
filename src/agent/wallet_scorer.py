@@ -87,21 +87,18 @@ class WalletScorer:
     async def score_wallet(self, wallet: str) -> Dict[str, Any]:
         """Compute metrics for one wallet. Returns dict with score, tier, components.
 
-        Helius.get_wallet_transactions() raises HeliusError on failure
-        (per the contract change in PR #2). We catch it here and fall
-        back to a neutral default so a single bad fetch doesn't tank
-        the whole scoring pass.
+        Deliberately does NOT catch HeliusError. Its only caller, score_all(),
+        catches it per-wallet and keeps whatever score that wallet already
+        had rather than overwriting it with a default (wallet_scorer.py's
+        score_all loop). Catching it here instead would return a normal
+        30/tier-3 result on a rate-limit failure, which score_all cannot
+        tell apart from a real score — silently poisoning _assign_tiers,
+        which ranks by percentile. See PR #2.
         """
         if "MOCK" in wallet or "REPLACE" in wallet:
             return self._default_score(wallet, reason="mock_wallet")
 
-        from src.data.helius import HeliusError
-        try:
-            txs = await self.helius.get_wallet_transactions(wallet, limit=100)
-        except HeliusError as e:
-            log.warning(f"HeliusError scoring {wallet[:8]}: {e}")
-            return self._default_score(wallet, reason=f"helius_error")
-
+        txs = await self.helius.get_wallet_transactions(wallet, limit=100)
         if not txs:
             return self._default_score(wallet, reason="no_transactions")
 
