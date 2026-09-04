@@ -7,16 +7,20 @@ the response text. The alerter delivers the response back to the chat.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from src.utils.logger import get_logger
+
 if TYPE_CHECKING:
     from src.alerts.telegram import TelegramAlerter
 
 
+log = get_logger("commands")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ALERTS_LOG = PROJECT_ROOT / "data" / "alerts.log"
 
@@ -35,6 +39,10 @@ def register_commands(alerter: "TelegramAlerter", agent):
             "/positions — open paper positions\n"
             "/wallets [top|rescore] — tier breakdown + recent buys\n"
             "/alerts [N] — last N alerts (default 5)\n\n"
+            "<b>GMGN:</b>\n"
+            "/gmgn &lt;address&gt; — holders, insiders, bundlers, rug ratio, security\n"
+            "/trending — top 10 tokens by GMGN's rank\n"
+            "/smart — recent smart-money / KOL buys\n\n"
             "<b>Actions:</b>\n"
             "/scan — force a scan cycle now\n"
             "/setcap N — set daily alert cap to N\n"
@@ -144,12 +152,25 @@ def register_commands(alerter: "TelegramAlerter", agent):
         if not recent:
             return header + "<i>No recent buys detected.</i>"
         body_lines = []
-        for m, w in list(recent.items())[:10]:
-            tier = agent.scorer.get_tier(w)
-            tier_emoji = {1: "🥇", 2: "🥈", 3: "🥉"}.get(tier, "📌")
+        for m, buyers in list(recent.items())[:10]:
+            # buyers is [(wallet, tier), ...] since stage 5 (PR #8) added
+            # the GMGN feed as a second signal source - was a single
+            # wallet string before that. This loop still assumed the old
+            # shape (`for m, w in ...` then indexing w[:8] as if w were a
+            # wallet address), which TypeErrors the moment a wallet
+            # actually buys something - i.e. it worked in every test that
+            # exercised /wallets against an empty _recent_wallet_buys, and
+            # broke the instant it wasn't. Show the best (lowest-tier)
+            # buyer per mint, same "best wallet wins" rule
+            # MemecoinAgent._evaluate_candidates uses.
+            if not buyers:
+                continue
+            best_wallet, best_tier = min(buyers, key=lambda wt: wt[1])
+            tier_emoji = {1: "🥇", 2: "🥈", 3: "🥉"}.get(best_tier, "📌")
+            extra = f" (+{len(buyers) - 1} more)" if len(buyers) > 1 else ""
             body_lines.append(
-                f"• {tier_emoji} <code>{w[:8]}...</code> bought "
-                f"<code>{m[:8]}...</code>"
+                f"• {tier_emoji} <code>{best_wallet[:8]}...</code> bought "
+                f"<code>{m[:8]}...</code>{extra}"
             )
         return header + "\n".join(body_lines)
 
@@ -272,6 +293,112 @@ def register_commands(alerter: "TelegramAlerter", agent):
         )
 
     # ------------------------------------------------------------------
+    # /gmgn, /trending, /smart — stage 7 of docs/gmgn-integration-plan.md
+    #
+    # Deliberately NOT gated behind agent.gmgn_enabled (the flag that
+    # controls whether GMGN feeds the live scan/scoring pipeline). These
+    # are manual, on-demand lookups through agent.gmgn, which always
+    # exists - same as /stats happily showing whatever Birdeye/Helius
+    # data is available (mock or real) regardless of any pipeline flag.
+    # That also means an operator with a real GMGN_API_KEY set can use
+    # these to sanity-check what GMGN actually returns before ever
+    # flipping gmgn.enabled on. When agent.gmgn has no real key,
+    # agent.gmgn.mock_mode is True and every call below returns its
+    # deterministic mock data (see src/data/gmgn.py) - the label on each
+    # reply says so, so mock output is never mistaken for a live read.
+    # ------------------------------------------------------------------
+    def _gmgn_mock_note() -> str:
+        return " <i>(mock data - GMGN not configured)</i>" if agent.gmgn.mock_mode else ""
+
+    async def cmd_gmgn(args: str) -> str:
+        addr = args.strip()
+        if not addr:
+            return "⚠️ Usage: <code>/gmgn &lt;token_address&gt;</code>"
+
+        holders, security = await asyncio.gather(
+            agent.gmgn.get_top_holders(addr),
+            agent.gmgn.get_token_security(addr),
+        )
+        if not holders and not security:
+            return f"⚠️ No GMGN data returned for <code>{addr[:8]}...</code>"
+
+        top10 = (holders.get("top_10_holder_rate") or 0) * 100
+        insider = (holders.get("suspected_insider_hold_rate") or 0) * 100
+        bundler = (holders.get("bundler_trader_amount_rate", holders.get("bundler_rate", 0)) or 0) * 100
+        holder_count = holders.get("holder_count", 0)
+        smart_stat = holders.get("wallet_tags_stat", {}) or {}
+        smart_count = smart_stat.get("smart_wallets", 0) + smart_stat.get("renowned_wallets", 0)
+
+        rug_ratio = security.get("rug_ratio", 0) or 0
+
+        def flag(v) -> str:
+            if v is None:
+                return "❓"
+            return "✅" if v else "❌"
+
+        return (
+            f"🔎 <b>GMGN Token Report</b>{_gmgn_mock_note()}\n"
+            f"<code>{addr}</code>\n\n"
+            f"<b>Holders</b>\n"
+            f"Top-10: <b>{top10:.1f}%</b> | Insiders: <b>{insider:.1f}%</b> | "
+            f"Bundlers: <b>{bundler:.1f}%</b>\n"
+            f"Holder count: {holder_count}\n\n"
+            f"<b>Security</b>\n"
+            f"Rug ratio: <b>{rug_ratio:.2f}</b>\n"
+            f"Mint renounced: {flag(security.get('renounced_mint'))} | "
+            f"Freeze renounced: {flag(security.get('renounced_freeze_account'))} | "
+            f"Owner renounced: {flag(security.get('owner_renounced'))}\n\n"
+            f"<b>Smart money</b>\n"
+            f"Smart/renowned holders: <b>{smart_count}</b>"
+        )
+
+    async def cmd_trending(args: str) -> str:
+        g = agent.cfg.get("gmgn", {})
+        items = await agent.gmgn.get_rank(
+            interval=g.get("rank_interval", "5m"),
+            limit=10,
+            order_by=g.get("rank_order_by", "volume"),
+        )
+        note = _gmgn_mock_note()
+        if not items:
+            return f"📈 <b>Trending</b>{note}\n\n<i>No data returned.</i>"
+        lines = [f"📈 <b>Trending (GMGN)</b>{note}\n"]
+        for i, item in enumerate(items[:10], 1):
+            sym = item.get("symbol", "?")
+            addr = item.get("address", "") or ""
+            mcap = item.get("market_cap", 0) or 0
+            vol = item.get("volume", 0) or 0
+            smart = (item.get("smart_degen_count") or 0) + (item.get("renowned_count") or 0)
+            lines.append(
+                f"{i}. <b>${sym}</b> <code>{addr[:8]}...</code>\n"
+                f"   MCAP ${mcap:,.0f} | Vol ${vol:,.0f} | Smart {smart}"
+            )
+        return "\n".join(lines)
+
+    async def cmd_smart(args: str) -> str:
+        smart_feed, kol_feed = await asyncio.gather(
+            agent.gmgn.get_smartmoney_feed(side="buy"),
+            agent.gmgn.get_kol_feed(side="buy"),
+        )
+        entries = [(e, "Smart") for e in (smart_feed or []) if e.get("side") == "buy"]
+        entries += [(e, "KOL") for e in (kol_feed or []) if e.get("side") == "buy"]
+        entries.sort(key=lambda pair: pair[0].get("timestamp", 0), reverse=True)
+
+        note = _gmgn_mock_note()
+        if not entries:
+            return f"🧠 <b>Smart Money</b>{note}\n\n<i>No recent buys.</i>"
+        lines = [f"🧠 <b>Recent Smart Money / KOL Buys</b>{note}\n"]
+        for entry, src in entries[:10]:
+            wallet = entry.get("maker", "?") or "?"
+            mint = entry.get("base_address", "?") or "?"
+            amt = entry.get("amount_usd", 0) or 0
+            lines.append(
+                f"• [{src}] <code>{wallet[:8]}...</code> bought "
+                f"<code>{mint[:8]}...</code> (${amt:,.0f})"
+            )
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # /pause, /resume
     # ------------------------------------------------------------------
     async def cmd_pause(args: str) -> str:
@@ -300,5 +427,8 @@ def register_commands(alerter: "TelegramAlerter", agent):
     alerter.register_command("scan", cmd_scan)
     alerter.register_command("setcap", cmd_setcap)
     alerter.register_command("closeall", cmd_closeall)
+    alerter.register_command("gmgn", cmd_gmgn)
+    alerter.register_command("trending", cmd_trending)
+    alerter.register_command("smart", cmd_smart)
     alerter.register_command("pause", cmd_pause)
     alerter.register_command("resume", cmd_resume)
