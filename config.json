@@ -11,11 +11,11 @@
   },
 
   "gmgn": {
-    "_note": "Wired for enrichment (stage 2), discovery (stage 3), K-line indicators (stage 4), wallet signals (stage 5/6), and Telegram commands (stage 7) - see docs/gmgn-integration-plan.md. enabled=true here still needs a real GMGN_API_KEY set as an environment variable on the deployment (agent/loop.py's gmgn_enabled requires both) - it is deliberately never read from this file. Without that env var, GMGNClient stays in mock mode regardless of this flag, so flipping this to true alone is safe. rank_interval/rank_limit/rank_order_by/max_rug_ratio/min_liquidity_usd/min_created feed GMGNClient.get_discovery_candidates() directly; kline_resolution/kline_budget_per_cycle/kline_lookback_candles/fib_lookback_candles feed MemecoinAgent._attach_kline_indicators(). fib_tolerance moved to rules.pullback_trading (it's a scoring parameter the engine reads, not a kline-fetch parameter this module cares about).",
+    "_note": "Wired for enrichment (stage 2), discovery (stage 3), K-line indicators (stage 4), wallet signals (stage 5/6), and Telegram commands (stage 7) - see docs/gmgn-integration-plan.md. enabled=true here still needs a real GMGN_API_KEY set as an environment variable on the deployment (agent/loop.py's gmgn_enabled requires both) - it is deliberately never read from this file. Without that env var, GMGNClient stays in mock mode regardless of this flag, so flipping this to true alone is safe. rank_interval/rank_limit/rank_order_by/max_rug_ratio/min_liquidity_usd/min_created feed GMGNClient.get_discovery_candidates() directly; kline_resolution/kline_budget_per_cycle/kline_lookback_candles/fib_lookback_candles feed MemecoinAgent._attach_kline_indicators(). fib_tolerance moved to rules.pullback_trading (it's a scoring parameter the engine reads, not a kline-fetch parameter this module cares about). transport defaults to 'cli' (not 'auto') - confirmed against github.com/GMGNAI/gmgn-skills that GMGN has no public HTTP REST endpoint, only the gmgn-cli npm package; 'auto' would still work (it self-detects and falls back) but 'cli' skips a guaranteed-fail HTTP round trip on every process start. Requires gmgn-cli actually installed on the deployment - see nixpacks.toml.",
     "enabled": true,
     "chain": "sol",
     "base_url": "",
-    "transport": "auto",
+    "transport": "cli",
     "rank_interval": "5m",
     "rank_limit": 100,
     "rank_order_by": "volume",
