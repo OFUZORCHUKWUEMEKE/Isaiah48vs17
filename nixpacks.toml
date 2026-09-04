@@ -1,0 +1,15 @@
+# Railway build config. The base Python app needs no customization
+# (Nixpacks auto-detects it from requirements.txt/runtime.txt), but the
+# GMGN integration's only supported transport is the gmgn-cli npm
+# package (confirmed against github.com/GMGNAI/gmgn-skills - GMGN does
+# not document a public HTTP REST endpoint), so Node.js + that package
+# need to be present at runtime alongside Python.
+[phases.setup]
+nixPkgs = ["nodejs_20"]
+
+[phases.install]
+cmds = [
+  "npm install -g gmgn-cli",
+  "python -m pip install --upgrade pip",
+  "pip install -r requirements.txt",
+]

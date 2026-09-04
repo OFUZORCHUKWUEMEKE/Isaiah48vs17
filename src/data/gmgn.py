@@ -7,18 +7,24 @@ Docs: https://gmgn.ai/ai (skill docs at github.com/GMGNAI/gmgn-skills)
 Read-only. Deliberately does not implement /gmgn-swap or /gmgn-cooking
 (trade execution) - see docs/gmgn-integration-plan.md for why.
 
-Transport note: GMGN's public docs describe the `gmgn-cli` binary; a
-public REST base URL is not documented and was not reachable from this
-development environment to verify directly. This client tries HTTP first
-and falls back to shelling out to `gmgn-cli --raw` on a transport-level
-failure. The CLI route mapping below is reconstructed from the skill
-docs, NOT from a live run of the binary - verify each mapping against
-`gmgn-cli --help` before depending on the CLI fallback in production.
+Transport note: confirmed against github.com/GMGNAI/gmgn-skills - GMGN
+does NOT document a public HTTP REST base URL; the only supported
+transport is the `gmgn-cli` npm package (`npm install -g gmgn-cli`),
+which every skill's SKILL.md invokes directly rather than curling an
+endpoint. This client still tries HTTP first (DEFAULT_BASE_URL below is
+an unconfirmed guess, kept only in case GMGN opens a direct REST route
+later) and falls back to `gmgn-cli --raw` on a transport-level failure -
+in practice this means every process falls back to CLI on its first
+request and stays there. The CLI route mapping in _CLI_MAP is now
+verified against the skill docs (see its own comment). Deploying this
+requires `gmgn-cli` to actually be installed and on PATH wherever the
+bot runs - see nixpacks.toml.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -191,10 +197,10 @@ class GMGNClient:
             pass
         return DEFAULT_COOLDOWN
 
-    # Best-effort reconstruction from the skill docs (github.com/GMGNAI/
-    # gmgn-skills) - NOT verified against a live gmgn-cli. Each entry is
-    # (subcommand words, positional/flag mapping). Confirm with
-    # `gmgn-cli <noun> --help` before relying on this path.
+    # Verified against github.com/GMGNAI/gmgn-skills' SKILL.md files
+    # (gmgn-market, gmgn-token, gmgn-portfolio, gmgn-track) - each of these
+    # subcommands, its underlying endpoint, and its auth requirement (API
+    # key only, no private-key signature) is quoted there.
     _CLI_MAP = {
         "token_info": ["token", "info"],
         "token_security": ["token", "security"],
@@ -202,10 +208,7 @@ class GMGNClient:
         "wallet_stats": ["portfolio", "stats"],
         "smartmoney_feed": ["track", "smartmoney"],
         "kol_feed": ["track", "kol"],
-        # Unconfirmed subcommand names - the skill docs describe these by
-        # function ("Trending/Rankings Command", "K-line (OHLCV) Command")
-        # but never quote the literal gmgn-cli invocation.
-        "rank": ["market", "rank"],
+        "rank": ["market", "trending"],
         "kline": ["market", "kline"],
     }
 
@@ -221,13 +224,17 @@ class GMGNClient:
             args.extend([f"--{k.replace('_', '-')}", str(v)])
         args.append("--raw")
 
-        env = {"GMGN_API_KEY": self.api_key} if self.api_key else {}
+        # Merge into the parent environment rather than replacing it - a
+        # bare {"GMGN_API_KEY": ...} drops PATH (and HOME, NODE_PATH, etc),
+        # so create_subprocess_exec can't even locate the gmgn-cli binary
+        # by name, regardless of whether it's installed.
+        env = {**os.environ, "GMGN_API_KEY": self.api_key} if self.api_key else None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=env or None,
+                env=env,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
         except FileNotFoundError:
