@@ -48,8 +48,14 @@ TIER2_PCT = 0.30  # next 20% (10% + 20% = 30% total)
 class WalletScorer:
     """Computes and caches wallet performance scores."""
 
-    def __init__(self, helius_client):
+    def __init__(self, helius_client, gmgn_client=None):
         self.helius = helius_client
+        # Optional. Pass None (the default) to score on-chain signals only,
+        # exactly as before this existed. The caller decides whether GMGN
+        # is actually usable (config flag AND a real key - see
+        # MemecoinAgent.gmgn_enabled) and passes None otherwise; this class
+        # doesn't re-derive that decision, it just uses what it's given.
+        self.gmgn = gmgn_client
         self._scores: Dict[str, Dict[str, Any]] = {}  # wallet -> {score, tier, metrics, ...}
         self._last_full_run: float = 0.0
         self._load_cache()
@@ -58,18 +64,40 @@ class WalletScorer:
     # Cache
     # ------------------------------------------------------------------
     def _load_cache(self):
-        if SCORES_PATH.exists():
-            try:
-                self._scores = json.loads(SCORES_PATH.read_text())
-                log.info(f"Loaded {len(self._scores)} cached wallet scores")
-            except Exception as e:
-                log.warning(f"Could not load wallet score cache: {e}")
-                self._scores = {}
+        if not SCORES_PATH.exists():
+            return
+        try:
+            raw = json.loads(SCORES_PATH.read_text())
+            if isinstance(raw, dict) and "wallets" in raw and "_meta" in raw:
+                # Current format: {"_meta": {"last_full_run": ...}, "wallets": {...}}
+                self._scores = raw.get("wallets", {}) or {}
+                self._last_full_run = raw.get("_meta", {}).get("last_full_run", 0.0) or 0.0
+                log.info(f"Loaded {len(self._scores)} cached wallet scores "
+                         f"(last full run: {self._last_full_run:.0f})")
+            else:
+                # Pre-stage-6 format: a flat {wallet: metrics} dict with no
+                # persisted last_full_run at all - that's the bug this
+                # stage fixes (is_cache_fresh() always returned False after
+                # a restart, forcing a full rescore on every redeploy).
+                # Load the scores as-is; _last_full_run stays 0.0 (the
+                # dataclass default) so is_cache_fresh() correctly reports
+                # stale exactly once more, then the next save migrates the
+                # file to the current format.
+                self._scores = raw if isinstance(raw, dict) else {}
+                log.info(f"Loaded {len(self._scores)} cached wallet scores "
+                         "(pre-stage-6 file format, no persisted last_full_run - will rescore once)")
+        except Exception as e:
+            log.warning(f"Could not load wallet score cache: {e}")
+            self._scores = {}
 
     def _save_cache(self):
         SCORES_PATH.parent.mkdir(exist_ok=True)
         try:
-            SCORES_PATH.write_text(json.dumps(self._scores, indent=2))
+            payload = {
+                "_meta": {"last_full_run": self._last_full_run},
+                "wallets": self._scores,
+            }
+            SCORES_PATH.write_text(json.dumps(payload, indent=2))
         except Exception as e:
             log.error(f"Could not save wallet score cache: {e}")
 
@@ -103,6 +131,8 @@ class WalletScorer:
             return self._default_score(wallet, reason="no_transactions")
 
         metrics = self._compute_metrics(wallet, txs)
+        if self.gmgn is not None:
+            await self._apply_gmgn_profitability(wallet, metrics)
         metrics["score"] = self._composite_score(metrics)
         return metrics
 
@@ -229,7 +259,56 @@ class WalletScorer:
             "specialization": specialization,
             "sample_size": len(closed_trades),  # number of buy→sell pairs we found
             "computed_at": time.time(),
+            # win_rate/avg_roi stay 0 here by design (see the module and
+            # _composite_score docstrings on why on-chain data alone can't
+            # derive them); _apply_gmgn_profitability fills them in when a
+            # GMGN client is available. has_gmgn_profitability distinguishes
+            # "never checked" from "GMGN genuinely reported 0" - without it
+            # those two cases would be indistinguishable to _composite_score.
+            "has_gmgn_profitability": False,
+            "is_likely_dev": False,
         }
+
+    async def _apply_gmgn_profitability(self, wallet: str, metrics: Dict[str, Any]) -> None:
+        """Fetch GMGN's wallet_stats and fill in the win_rate/avg_roi this
+        module's docstring says on-chain data alone can't derive - the
+        actual point of stage 6 of docs/gmgn-integration-plan.md. Mutates
+        `metrics` in place; never raises. GMGNClient.get_wallet_stats
+        already catches its own failures and returns {} (see src/data/gmgn.py),
+        so the try/except here is only for something outside that contract -
+        a wallet_stats failure must degrade to the on-chain-only score, not
+        fail the whole wallet the way a HeliusError deliberately does
+        (that asymmetry is intentional: Helius data is this scorer's only
+        input and a failure there means "we know nothing", while GMGN here
+        is purely additive enrichment of data _compute_metrics already
+        produced).
+
+        GMGN's rates are 0-1 fractions, same as every other GMGN field this
+        integration converts; win_rate and avg_roi are stored as percents
+        (x100) for consistency with the rest of the codebase's percent-
+        scaled fields (top10_pct, insider_pct, ...).
+        """
+        try:
+            stats = await self.gmgn.get_wallet_stats(wallet)
+        except Exception as e:
+            log.debug(f"GMGN wallet_stats failed for {wallet[:8]}: {e}")
+            return
+        if not stats:
+            return
+
+        pnl = stats.get("pnl_stat", {}) or {}
+        winrate = pnl.get("winrate")
+        roi = stats.get("roi")
+        if winrate is None and roi is None:
+            return
+
+        if winrate is not None:
+            metrics["win_rate"] = winrate * 100
+        if roi is not None:
+            metrics["avg_roi"] = roi * 100
+        metrics["gmgn_token_num"] = pnl.get("token_num", 0)
+        metrics["is_likely_dev"] = (stats.get("common", {}) or {}).get("created_token_count", 0) > 0
+        metrics["has_gmgn_profitability"] = True
 
     def _native_sol_change(self, tx: Dict[str, Any], wallet: str) -> Optional[float]:
         """Estimate SOL change for this wallet from a tx. Positive = received SOL, negative = spent SOL.
@@ -264,20 +343,34 @@ class WalletScorer:
     def _composite_score(self, m: Dict[str, Any]) -> float:
         """Convert metrics into a 0-100 score.
 
-        We can't compute ROI from on-chain data alone (Jupiter/Raydium route
-        SOL through intermediary accounts so user balance change is 0).
-        Instead we score on signals that ARE reliable:
+        On-chain data alone can't compute ROI (Jupiter/Raydium route SOL
+        through intermediary accounts so user balance change is 0) - that
+        used to mean scoring on signals that only correlate with skill:
           - Activity (25): how many txs/week (more = better signal source)
           - Recency (25): active recently (dormant = no signal)
           - Specialization (20): % of txs that are SWAPs vs transfers
           - Hold discipline (15): how long they hold before selling
           - Token diversity (15): how many different mints they trade
-        """
-        # Activity (0-25 pts): scale up to 20 txs/week = full marks
-        week = m.get("week_txs", 0)
-        activity_score = min(25, week * 1.25)  # 20 txs/week = 25 pts
 
-        # Recency (0-25 pts): decay based on days since last activity
+        Stage 6 of docs/gmgn-integration-plan.md adds a sixth component,
+        Profitability (25), from GMGN's wallet_stats - the actual win rate
+        and ROI this docstring used to say were unavailable. The five
+        original weights summed to 100, so they're rescaled by 0.8/0.8/
+        0.75/0.667/0.667 respectively (each bucket's internal shape -
+        which range scores best - is unchanged; only the point ceiling
+        moved) to make room: 20+20+15+10+10+25=100.
+
+        Profitability contributes 0 when has_gmgn_profitability is False
+        (GMGN disabled, or its call failed for this wallet) rather than
+        penalizing wallets a real signal simply isn't available for yet -
+        the other five components already carry the wallet on their own,
+        same as before this component existed.
+        """
+        # Activity (0-20 pts, was 0-25): scale up to 20 txs/week = full marks
+        week = m.get("week_txs", 0)
+        activity_score = min(20, week * 1.0)  # 20 txs/week = 20 pts
+
+        # Recency (0-20 pts, was 0-25): decay based on days since last activity
         days = m.get("days_since_active", 999)
         if days < 0.5:
             recency = 1.0
@@ -291,45 +384,61 @@ class WalletScorer:
             recency = 0.2
         else:
             recency = 0.0
-        recency_score = recency * 25
+        recency_score = recency * 20
 
-        # Specialization (0-20 pts): high % of SWAPs = focused trader
+        # Specialization (0-15 pts, was 0-20): high % of SWAPs = focused trader
         spec = m.get("specialization", 0)
-        specialization_score = min(20, spec * 22)  # 0.9 spec = 20 pts
+        specialization_score = min(15, spec * 16.5)  # 0.9 spec = 14.85 pts
 
-        # Hold discipline (0-15 pts): avg hold time in hours
+        # Hold discipline (0-10 pts, was 0-15): avg hold time in hours
         # Sweet spot is 1-72h (active trading). <1h = noise/scalper, >72h = bag-holder
         hold_h = m.get("avg_hold_hours", 0)
         if hold_h < 0.5:
-            hold_score = 3  # too fast, probably noise
+            hold_score = 2  # too fast, probably noise
         elif hold_h < 1:
-            hold_score = 8
+            hold_score = 5
         elif hold_h < 6:
-            hold_score = 15  # ideal
+            hold_score = 10  # ideal
         elif hold_h < 24:
-            hold_score = 12
-        elif hold_h < 72:
             hold_score = 8
+        elif hold_h < 72:
+            hold_score = 5
         elif hold_h < 168:
-            hold_score = 5  # bag-holder
+            hold_score = 3  # bag-holder
         else:
-            hold_score = 2
+            hold_score = 1
 
-        # Token diversity (0-15 pts): how many unique tokens traded
+        # Token diversity (0-10 pts, was 0-15): how many unique tokens traded
         # 5-20 is ideal (researcher, not one-coin gambler, not degen)
         div = m.get("token_diversity", 0)
         if div < 3:
-            div_score = 3
+            div_score = 2
         elif div < 5:
-            div_score = 8
+            div_score = 5
         elif div < 10:
-            div_score = 13
+            div_score = 9
         elif div < 20:
-            div_score = 15  # ideal
+            div_score = 10  # ideal
         elif div < 50:
-            div_score = 12
+            div_score = 8
         else:
-            div_score = 8  # might be a bot, or just very scattered
+            div_score = 5  # might be a bot, or just very scattered
+
+        # Profitability (0-25 pts, new): GMGN-reported win rate + ROI, when
+        # available. win_rate/avg_roi are percents (see
+        # _apply_gmgn_profitability); an unbounded ROI is capped rather
+        # than let one huge outlier trade dominate the score. This split
+        # (15 for win rate, 10 for ROI) and the ROI cap are a starting
+        # point, not calibrated against live GMGN traffic - same caveat as
+        # min_pro_traders (stage 3) and min_5m_to_1m_ratio (stage 4).
+        if m.get("has_gmgn_profitability"):
+            win_rate = m.get("win_rate", 0)  # 0-100
+            avg_roi = m.get("avg_roi", 0)    # percent, can be negative
+            win_component = max(0, min(15, (win_rate / 100) * 15))
+            roi_component = max(0, min(10, avg_roi / 10))  # 100%+ ROI = full 10 pts
+            profitability_score = win_component + roi_component
+        else:
+            profitability_score = 0
 
         # Apply a soft penalty for very low closed-position counts
         # (we want wallets that actually trade, not just hold)
@@ -341,7 +450,8 @@ class WalletScorer:
         else:
             sample_penalty = 1.0
 
-        raw = activity_score + recency_score + specialization_score + hold_score + div_score
+        raw = (activity_score + recency_score + specialization_score
+               + hold_score + div_score + profitability_score)
         return max(0, min(100, raw * sample_penalty))
 
     def _default_score(self, wallet: str, reason: str) -> Dict[str, Any]:
@@ -356,6 +466,8 @@ class WalletScorer:
             "avg_roi": 0,
             "days_since_active": 999,
             "week_txs": 0,
+            "has_gmgn_profitability": False,
+            "is_likely_dev": False,
             "reason": reason,
             "computed_at": time.time(),
         }
@@ -407,8 +519,14 @@ class WalletScorer:
                     f"{failed}/{len(to_score)} wallets failed to score; "
                     "kept previous scores where available"
                 )
-            self._save_cache()
+            # Set before saving, not after: _save_cache() persists
+            # _last_full_run now that stage 6 added that to the file (it
+            # used to be in-memory only, so the ordering didn't matter).
+            # _assign_tiers() below saves again unconditionally, so this
+            # save's value was never actually lost - but writing the stale
+            # timestamp even briefly was never correct either.
             self._last_full_run = now
+            self._save_cache()
 
         # Now assign tiers
         self._assign_tiers(wallets)
