@@ -11,8 +11,8 @@
   },
 
   "gmgn": {
-    "_note": "Wired for enrichment (stage 2), discovery (stage 3), and K-line indicators (stage 4) - see docs/gmgn-integration-plan.md. Stays inactive with enabled=false; flipping this to true ALSO needs a real GMGN_API_KEY (agent/loop.py requires both). rank_interval/rank_limit/rank_order_by/max_rug_ratio/min_liquidity_usd/min_created feed GMGNClient.get_discovery_candidates() directly; kline_resolution/kline_budget_per_cycle/kline_lookback_candles/fib_lookback_candles feed MemecoinAgent._attach_kline_indicators(). fib_tolerance moved to rules.pullback_trading (it's a scoring parameter the engine reads, not a kline-fetch parameter this module cares about).",
-    "enabled": false,
+    "_note": "Wired for enrichment (stage 2), discovery (stage 3), K-line indicators (stage 4), wallet signals (stage 5/6), and Telegram commands (stage 7) - see docs/gmgn-integration-plan.md. enabled=true here still needs a real GMGN_API_KEY set as an environment variable on the deployment (agent/loop.py's gmgn_enabled requires both) - it is deliberately never read from this file. Without that env var, GMGNClient stays in mock mode regardless of this flag, so flipping this to true alone is safe. rank_interval/rank_limit/rank_order_by/max_rug_ratio/min_liquidity_usd/min_created feed GMGNClient.get_discovery_candidates() directly; kline_resolution/kline_budget_per_cycle/kline_lookback_candles/fib_lookback_candles feed MemecoinAgent._attach_kline_indicators(). fib_tolerance moved to rules.pullback_trading (it's a scoring parameter the engine reads, not a kline-fetch parameter this module cares about).",
+    "enabled": true,
     "chain": "sol",
     "base_url": "",
     "transport": "auto",
