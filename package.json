@@ -1,0 +1,8 @@
+{
+  "name": "isaiah48vs17-gmgn-cli-dep",
+  "private": true,
+  "description": "Not a Node app - this file exists only so `npm install` (run by nixpacks.toml during the Railway build) has a package.json to write gmgn-cli into, at a path src/data/gmgn.py resolves directly (node_modules/.bin/gmgn-cli). See src/data/gmgn.py's module docstring for why a global npm install doesn't work here.",
+  "dependencies": {
+    "gmgn-cli": "^1.6.0"
+  }
+}
