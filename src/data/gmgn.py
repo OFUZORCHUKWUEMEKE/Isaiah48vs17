@@ -7,25 +7,36 @@ Docs: https://gmgn.ai/ai (skill docs at github.com/GMGNAI/gmgn-skills)
 Read-only. Deliberately does not implement /gmgn-swap or /gmgn-cooking
 (trade execution) - see docs/gmgn-integration-plan.md for why.
 
-Transport note: confirmed against github.com/GMGNAI/gmgn-skills - GMGN
-does NOT document a public HTTP REST base URL; the only supported
-transport is the `gmgn-cli` npm package (`npm install -g gmgn-cli`),
-which every skill's SKILL.md invokes directly rather than curling an
-endpoint. This client still tries HTTP first (DEFAULT_BASE_URL below is
-an unconfirmed guess, kept only in case GMGN opens a direct REST route
-later) and falls back to `gmgn-cli --raw` on a transport-level failure -
-in practice this means every process falls back to CLI on its first
-request and stays there. The CLI route mapping in _CLI_MAP is now
-verified against the skill docs (see its own comment). Deploying this
-requires `gmgn-cli` to actually be installed and on PATH wherever the
-bot runs - see nixpacks.toml.
+Transport note: confirmed against github.com/GMGNAI/gmgn-skills AND by
+actually installing and running gmgn-cli locally - GMGN does NOT expose
+a public HTTP REST base URL; the only supported transport is the
+`gmgn-cli` npm package. Every _CLI_MAP entry below is verified against
+the real binary's own `--help` output, not just doc prose. This client
+still tries HTTP first (DEFAULT_BASE_URL below is an unconfirmed guess,
+kept only in case GMGN opens a direct REST route later) and falls back
+to `gmgn-cli --raw` on a transport-level failure - in practice this
+means every process falls back to CLI on its first request and stays
+there.
+
+Binary resolution (see _resolve_cli_binary): a global `npm install -g`
+on Railway/Nixpacks left the binary unreachable ("gmgn-cli not found on
+PATH") even after installing Node.js, most likely because the npm
+global bin directory isn't carried into the runtime image's PATH across
+Nixpacks' build/run phase boundary - this is a real, observed production
+failure, not a hypothetical. To sidestep that whole class of problem,
+nixpacks.toml now does a LOCAL `npm install gmgn-cli` (no -g) into the
+app's own directory, and this module resolves the binary by an absolute
+path relative to PROJECT_ROOT rather than trusting shell PATH lookup at
+all. GMGN_CLI_PATH can override this explicitly if needed.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import shutil
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -33,6 +44,26 @@ import httpx
 from src.utils.logger import get_logger
 
 log = get_logger("gmgn")
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _resolve_cli_binary() -> str:
+    """Find the gmgn-cli executable without trusting PATH alone.
+
+    Priority: explicit GMGN_CLI_PATH override, then the local install
+    this app's own nixpacks.toml produces (PROJECT_ROOT/node_modules/
+    .bin/gmgn-cli - an absolute path, immune to PATH/env differences
+    between build and runtime), then a bare PATH lookup as a last resort
+    for local dev setups that installed it globally themselves.
+    """
+    override = os.environ.get("GMGN_CLI_PATH", "")
+    if override and Path(override).is_file():
+        return override
+    local = PROJECT_ROOT / "node_modules" / ".bin" / "gmgn-cli"
+    if local.is_file():
+        return str(local)
+    return shutil.which("gmgn-cli") or "gmgn-cli"
 
 DEFAULT_BASE_URL = "https://api.gmgn.ai"
 
@@ -129,8 +160,11 @@ class GMGNClient:
         self._transport = "mock" if self.mock_mode else ("http" if transport == "auto" else transport)
         self._client = httpx.AsyncClient(timeout=15.0)
         self._bucket = _LeakyBucket()
+        self._cli_binary = _resolve_cli_binary()
         if self.mock_mode:
             log.warning("GMGN running in MOCK mode (no API key)")
+        elif self._transport == "cli":
+            log.info(f"GMGN CLI transport resolved binary: {self._cli_binary}")
 
     def _redact(self, text: str) -> str:
         if self.api_key:
@@ -217,7 +251,7 @@ class GMGNClient:
         if not subcommand:
             raise GMGNError(f"no CLI mapping for route '{route_key}'")
 
-        args = ["gmgn-cli", *subcommand, "--chain", self.chain]
+        args = [self._cli_binary, *subcommand, "--chain", self.chain]
         for k, v in params.items():
             if v is None:
                 continue
@@ -238,7 +272,10 @@ class GMGNClient:
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
         except FileNotFoundError:
-            raise GMGNError("gmgn-cli not found on PATH - CLI fallback needs the binary installed") from None
+            raise GMGNError(
+                f"gmgn-cli not found at resolved path '{self._cli_binary}' - "
+                "checked GMGN_CLI_PATH, PROJECT_ROOT/node_modules/.bin, then PATH"
+            ) from None
         except asyncio.TimeoutError:
             raise GMGNError(f"gmgn-cli timed out: {' '.join(subcommand)}") from None
 

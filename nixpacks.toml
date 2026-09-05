@@ -1,15 +1,25 @@
 # Railway build config. The base Python app needs no customization
 # (Nixpacks auto-detects it from requirements.txt/runtime.txt), but the
 # GMGN integration's only supported transport is the gmgn-cli npm
-# package (confirmed against github.com/GMGNAI/gmgn-skills - GMGN does
-# not document a public HTTP REST endpoint), so Node.js + that package
-# need to be present at runtime alongside Python.
+# package (confirmed against github.com/GMGNAI/gmgn-skills, and by
+# actually installing and running the real binary - GMGN has no public
+# HTTP REST endpoint), so Node.js + that package need to be present at
+# runtime alongside Python.
+#
+# LOCAL install, not `npm install -g`: a global install left the binary
+# unreachable in production ("gmgn-cli not found on PATH") even with
+# Node.js present, almost certainly because npm's global bin directory
+# doesn't carry across Nixpacks' build/run phase boundary. A local
+# install puts the binary at <repo>/node_modules/.bin/gmgn-cli, which
+# src/data/gmgn.py resolves by an absolute path built from its own
+# PROJECT_ROOT (see _resolve_cli_binary) - no PATH lookup involved at
+# all, so this can't fail the same way again.
 [phases.setup]
 nixPkgs = ["nodejs_20"]
 
 [phases.install]
 cmds = [
-  "npm install -g gmgn-cli",
+  "npm install gmgn-cli",
   "python -m pip install --upgrade pip",
   "pip install -r requirements.txt",
 ]

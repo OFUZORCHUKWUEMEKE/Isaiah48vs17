@@ -23,6 +23,11 @@ dist/
 .mypy_cache/
 .ruff_cache/
 
+# --- Node (gmgn-cli, installed locally by nixpacks.toml - see src/data/gmgn.py) ---
+# package.json/package-lock.json ARE committed for reproducible builds -
+# only the installed tree itself is ignored.
+node_modules/
+
 # --- Agent runtime state ---
 # Comment these out if you WANT to commit pre-computed wallet scores
 # and the paper ledger to your repo. Default: keep them out so Railway
