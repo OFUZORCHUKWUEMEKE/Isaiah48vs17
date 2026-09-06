@@ -7,27 +7,36 @@ Docs: https://gmgn.ai/ai (skill docs at github.com/GMGNAI/gmgn-skills)
 Read-only. Deliberately does not implement /gmgn-swap or /gmgn-cooking
 (trade execution) - see docs/gmgn-integration-plan.md for why.
 
-Transport note: confirmed against github.com/GMGNAI/gmgn-skills AND by
-actually installing and running gmgn-cli locally - GMGN does NOT expose
-a public HTTP REST base URL; the only supported transport is the
-`gmgn-cli` npm package. Every _CLI_MAP entry below is verified against
-the real binary's own `--help` output, not just doc prose. This client
-still tries HTTP first (DEFAULT_BASE_URL below is an unconfirmed guess,
-kept only in case GMGN opens a direct REST route later) and falls back
-to `gmgn-cli --raw` on a transport-level failure - in practice this
-means every process falls back to CLI on its first request and stays
-there.
+Transport: plain HTTP, no external binary required.
 
-Binary resolution (see _resolve_cli_binary): a global `npm install -g`
-on Railway/Nixpacks left the binary unreachable ("gmgn-cli not found on
-PATH") even after installing Node.js, most likely because the npm
-global bin directory isn't carried into the runtime image's PATH across
-Nixpacks' build/run phase boundary - this is a real, observed production
-failure, not a hypothetical. To sidestep that whole class of problem,
-nixpacks.toml now does a LOCAL `npm install gmgn-cli` (no -g) into the
-app's own directory, and this module resolves the binary by an absolute
-path relative to PROJECT_ROOT rather than trusting shell PATH lookup at
-all. GMGN_CLI_PATH can override this explicitly if needed.
+Earlier revisions of this module shelled out to the `gmgn-cli` npm
+package because GMGN's public docs only ever demonstrate the CLI, and
+the HTTP base URL/auth scheme were guessed (wrongly) from doc prose.
+That guess is why HTTP never worked, why every process silently fell
+back to the CLI, and - once the CLI turned out to be missing or
+unreachable on the deployment - why GMGN contributed no data at all.
+
+The wire protocol implemented in _request_http is no longer guessed. It
+was read directly out of the published gmgn-cli package's own source
+(npm gmgn-cli@1.6.1, dist/config.js + dist/client/OpenApiClient.js),
+which is itself just a thin HTTP client:
+
+  - host      https://openapi.gmgn.ai   (NOT api.gmgn.ai)
+  - header    X-APIKEY: <key>           (NOT Authorization: Bearer)
+  - query     timestamp + client_id     (required; small skew tolerance)
+  - response  {"code": 0, "data": ...}  (nonzero code = error, HTTP 200)
+  - IPv4 only (GMGN answers 401/403 over IPv6)
+
+Every route used here is "exist auth" in GMGN's terms - API key only.
+GMGN_PRIVATE_KEY signs swap/order/holdings routes, none of which this
+read-only client touches, so no signing is implemented.
+
+The gmgn-cli subprocess path is still present as an optional fallback
+(set gmgn.transport="cli" to force it, GMGN_CLI_PATH to point at a
+binary), and its _CLI_MAP entries are verified against the real
+binary's --help. But nothing requires it any more: with transport
+"auto"/"http" the bot talks to GMGN directly and needs no Node.js, no
+npm install, and no PATH assumptions on the deployment.
 """
 from __future__ import annotations
 
@@ -36,6 +45,7 @@ import json
 import os
 import shutil
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -65,7 +75,15 @@ def _resolve_cli_binary() -> str:
         return str(local)
     return shutil.which("gmgn-cli") or "gmgn-cli"
 
-DEFAULT_BASE_URL = "https://api.gmgn.ai"
+# Verified by reading gmgn-cli's own dist/config.js and
+# dist/client/OpenApiClient.js (npm package gmgn-cli@1.6.1). The earlier
+# value here ("https://api.gmgn.ai") was a guess and was simply wrong,
+# which is why the HTTP transport never worked and every process fell
+# through to the CLI.
+DEFAULT_BASE_URL = "https://openapi.gmgn.ai"
+
+# gmgn-cli sends this; some WAFs treat an absent/!generic UA as a bot.
+USER_AGENT = "gmgn-cli/1.6.1"
 
 # Leaky-bucket rate limit per GMGN's docs: rate=20, capacity=20, cost=weight.
 BUCKET_RATE = 20.0
@@ -158,7 +176,15 @@ class GMGNClient:
         # stays on CLI for the rest of the process (no flapping back to a
         # base URL that's already been shown not to work).
         self._transport = "mock" if self.mock_mode else ("http" if transport == "auto" else transport)
-        self._client = httpx.AsyncClient(timeout=15.0)
+        # Bind the local socket to an IPv4 address so connections can't go
+        # out over IPv6. gmgn-cli does the same thing deliberately
+        # (buildConnector({family: 4}) in its dist/index.js), and GMGN's
+        # own docs warn that requests over IPv6 come back 401/403 even with
+        # correct credentials.
+        self._client = httpx.AsyncClient(
+            timeout=15.0,
+            transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0"),
+        )
         self._bucket = _LeakyBucket()
         self._cli_binary = _resolve_cli_binary()
         if self.mock_mode:
@@ -195,10 +221,36 @@ class GMGNClient:
             return await self._request_cli(route_key, params)
 
     async def _request_http(self, route: str, params: Dict[str, Any]) -> Any:
+        """One GMGN OpenAPI call over HTTP.
+
+        The wire format here is not guesswork - it mirrors gmgn-cli's own
+        OpenApiClient.authExistRequest() (npm gmgn-cli@1.6.1,
+        dist/client/OpenApiClient.js) exactly:
+
+          - header  X-APIKEY: <key>          (NOT Authorization: Bearer)
+          - header  User-Agent: gmgn-cli/... (some edges reject blank UAs)
+          - query   timestamp: unix seconds  (server allows about +/-5s skew)
+          - query   client_id: a UUID        (replays rejected within ~7s)
+          - body    {"code": 0, "data": ...} - any nonzero code is an error
+
+        All the routes this client uses are "exist auth" in GMGN's terms:
+        API key only. The Ed25519 GMGN_PRIVATE_KEY is required solely for
+        swap/order/follow-wallet/holdings routes, none of which this
+        read-only client touches - so no request signing is needed here.
+        """
         url = f"{self.base_url}{route}"
-        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        query = {
+            **params,
+            "timestamp": int(time.time()),
+            "client_id": str(uuid.uuid4()),
+        }
+        headers = {
+            "X-APIKEY": self.api_key,
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        }
         try:
-            r = await self._client.get(url, params=params, headers=headers)
+            r = await self._client.get(url, params=query, headers=headers)
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.UnsupportedProtocol) as e:
             raise _TransportUnavailable(f"{type(e).__name__}: {e}") from None
         except Exception as e:
@@ -207,7 +259,14 @@ class GMGNClient:
         if r.status_code == 404:
             raise _TransportUnavailable(f"404 at {route} - base_url is probably wrong")
         if r.status_code in (401, 403):
-            raise _TransportUnavailable(f"HTTP {r.status_code} - auth rejected over HTTP")
+            # Don't assume "bad key" here: an intercepting proxy answers 403
+            # the same way, and GMGN itself 401/403s requests that egress
+            # over IPv6 (hence the IPv4-bound transport in __init__).
+            raise GMGNError(
+                f"HTTP {r.status_code} at {route} - rejected before returning data. "
+                "Usual causes, in order: GMGN_API_KEY invalid/expired, the request "
+                "leaving over IPv6, or an outbound proxy blocking openapi.gmgn.ai."
+            )
         if r.status_code == 429:
             wait = self._note_rate_limit_http(r)
             self._bucket.note_cooldown(wait)
@@ -217,9 +276,20 @@ class GMGNClient:
         except httpx.HTTPStatusError as e:
             raise GMGNError(self._redact(str(e))) from None
         try:
-            return r.json()
+            body = r.json()
         except Exception as e:
             raise GMGNError(f"malformed response body: {type(e).__name__}") from None
+
+        # GMGN wraps everything in {"code": 0, "data": ...}. A nonzero code
+        # is an application-level error even though the HTTP status is 200.
+        if isinstance(body, dict) and "code" in body:
+            if body.get("code") != 0:
+                raise GMGNError(self._redact(
+                    f"{route} failed: code={body.get('code')} "
+                    f"error={body.get('error')} message={body.get('message')}"
+                ))
+            return body.get("data")
+        return body
 
     def _note_rate_limit_http(self, response: httpx.Response) -> float:
         try:
@@ -298,7 +368,10 @@ class GMGNClient:
         try:
             params = {"chain": self.chain, **filters}
             data = await self._request("/v1/market/rank", params, "rank")
-            return data.get("data", data) if isinstance(data, dict) else data
+            # Same list-or-wrapped handling as the feeds: /v1/market/rank
+            # answers a list under one of a few plausible keys depending on
+            # the query, so don't assume one shape.
+            return self._feed_entries(data)
         except GMGNError as e:
             log.error(f"GMGN get_rank failed: {e}")
             return []
@@ -440,36 +513,76 @@ class GMGNClient:
             log.error(f"GMGN get_kline({address[:8]}) failed: {e}")
             return []
 
-    async def get_wallet_stats(self, wallet: str) -> Dict[str, Any]:
+    async def get_wallet_stats(self, wallet: str, period: str = "7d") -> Dict[str, Any]:
         if self.mock_mode or "MOCK" in wallet or "REPLACE" in wallet:
             return self._mock_wallet_stats(wallet)
         try:
+            # Param name is wallet_address (not "wallet") and period is
+            # required - see gmgn-cli's OpenApiClient.getWalletStats().
             data = await self._request(
-                "/v1/user/wallet_stats", {"chain": self.chain, "wallet": wallet}, "wallet_stats"
+                "/v1/user/wallet_stats",
+                {"chain": self.chain, "wallet_address": wallet, "period": period},
+                "wallet_stats",
             )
-            return data.get("data", data) if isinstance(data, dict) else {}
+            return self._unwrap_stats(data)
         except GMGNError as e:
             log.error(f"GMGN get_wallet_stats({wallet[:8]}) failed: {e}")
             return {}
 
-    async def get_smartmoney_feed(self, **filters: Any) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _unwrap_stats(data: Any) -> Dict[str, Any]:
+        """wallet_stats supports multiple wallets, so the payload can come
+        back as a list (or {"list": [...]}) even when one wallet was asked
+        for. Take the first entry in that case; a plain dict passes through.
+        """
+        if isinstance(data, dict):
+            inner = data.get("list") if isinstance(data.get("list"), list) else None
+            if inner is not None:
+                return inner[0] if inner else {}
+            return data.get("data", data) if "data" in data else data
+        if isinstance(data, list):
+            return data[0] if data else {}
+        return {}
+
+    @staticmethod
+    def _feed_entries(data: Any, side: str = "") -> List[Dict[str, Any]]:
+        """Normalize a smartmoney/kol payload to a list of trade records.
+
+        These routes answer {"list": [...]}. `side` is deliberately NOT
+        sent to the API - gmgn-cli filters it client-side after the call
+        (see registerTrackCommands in its dist/commands/track.js), so
+        sending it as a query param would just be ignored at best.
+        """
+        items = data
+        if isinstance(data, dict):
+            for key in ("list", "rank", "data", "items"):
+                if isinstance(data.get(key), list):
+                    items = data[key]
+                    break
+        if not isinstance(items, list):
+            return []
+        if side:
+            items = [i for i in items if isinstance(i, dict) and i.get("side") == side]
+        return [i for i in items if isinstance(i, dict)]
+
+    async def get_smartmoney_feed(self, side: str = "", **filters: Any) -> List[Dict[str, Any]]:
         if self.mock_mode:
             return self._mock_feed("smartmoney")
         try:
             params = {"chain": self.chain, **filters}
             data = await self._request("/v1/user/smartmoney", params, "smartmoney_feed")
-            return data.get("data", data) if isinstance(data, dict) else data
+            return self._feed_entries(data, side)
         except GMGNError as e:
             log.error(f"GMGN get_smartmoney_feed failed: {e}")
             return []
 
-    async def get_kol_feed(self, **filters: Any) -> List[Dict[str, Any]]:
+    async def get_kol_feed(self, side: str = "", **filters: Any) -> List[Dict[str, Any]]:
         if self.mock_mode:
             return self._mock_feed("kol")
         try:
             params = {"chain": self.chain, **filters}
             data = await self._request("/v1/user/kol", params, "kol_feed")
-            return data.get("data", data) if isinstance(data, dict) else data
+            return self._feed_entries(data, side)
         except GMGNError as e:
             log.error(f"GMGN get_kol_feed failed: {e}")
             return []
