@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 import threading
 
 from src.utils.logger import get_logger
+from src.version import BUILD_MARKER, BUILD_NOTE
 
 log = get_logger("health")
 
@@ -62,10 +63,14 @@ def _make_handler():
 
         def do_GET(self):
             if self.path in ("/", "/health", "/healthz"):
+                # build is here (not just /status) so that confirming which
+                # code is live needs no agent state and no log access.
                 self._json(200, {
                     "status": "ok",
                     "uptime_s": int(time.time() - _started_at),
                     "service": "memecoin-runner-agent",
+                    "build": BUILD_MARKER,
+                    "build_note": BUILD_NOTE,
                 })
             elif self.path == "/status":
                 self._json(200, _get_status())
@@ -102,8 +107,14 @@ def _get_status() -> Dict[str, Any]:
         breakdown = _agent_ref.scorer.get_tier_breakdown() if _agent_ref.scorer else {}
         return {
             "status": "running",
+            "build": BUILD_MARKER,
             "uptime_s": int(time.time() - _started_at),
             "mode": _agent_ref.cfg.get("mode"),
+            "gmgn": {
+                "enabled": getattr(_agent_ref, "gmgn_enabled", None),
+                "transport": getattr(getattr(_agent_ref, "gmgn", None), "_transport", None),
+                "base_url": getattr(getattr(_agent_ref, "gmgn", None), "base_url", None),
+            },
             "tracked_wallets": len(_agent_ref.tracked_wallets),
             "tier_breakdown": breakdown,
             "alerts_sent_today": _agent_ref.alerter._today_count,

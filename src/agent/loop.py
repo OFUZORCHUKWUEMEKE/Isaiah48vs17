@@ -29,6 +29,7 @@ from src.rules.engine import RuleEngine, Verdict, Tier
 from src.rules.indicators import volume_metrics, fib_retracement
 from src.utils.config import load_config, has_real_credentials
 from src.utils.logger import get_logger
+from src.version import BUILD_MARKER, BUILD_NOTE
 
 log = get_logger("agent")
 
@@ -104,8 +105,16 @@ class MemecoinAgent:
         # Track per-tier buys: mint -> set of tier labels
         self._recent_buys_by_tier: Dict[str, set] = {}  # mint -> {"T1", "T2", "T3"}
 
+        # Logged first and unconditionally: if a deployment is serving a
+        # stale image, this line is the fastest way to notice.
+        log.info(f"BUILD {BUILD_MARKER} | {BUILD_NOTE}")
         log.info(f"Agent initialized | mode={config['mode']} | "
                  f"real_creds={creds} | wallets={len(self.tracked_wallets)}")
+        log.info(
+            f"GMGN | enabled={self.gmgn_enabled} "
+            f"| transport={self.gmgn._transport} "
+            f"| base_url={self.gmgn.base_url}"
+        )
 
     # ------------------------------------------------------------------
     # Main loop
