@@ -23,17 +23,22 @@ dist/
 .mypy_cache/
 .ruff_cache/
 
-# --- Node (gmgn-cli, installed locally by nixpacks.toml - see src/data/gmgn.py) ---
-# package.json/package-lock.json ARE committed for reproducible builds -
-# only the installed tree itself is ignored.
+# --- Node (only relevant if you opt into the legacy gmgn-cli fallback
+# transport - see src/data/gmgn.py's _resolve_cli_binary. Not used by
+# default since PR #14/#15 switched to direct HTTP and removed the
+# nixpacks.toml/package.json build step that used to install this.) ---
 node_modules/
 
 # --- Agent runtime state ---
-# Comment these out if you WANT to commit pre-computed wallet scores
-# and the paper ledger to your repo. Default: keep them out so Railway
-# rebuilds scoring from scratch on each deploy.
+# Comment these out if you WANT to commit pre-computed wallet scores,
+# the paper ledger, and the decision journal to your repo. Default: keep
+# them out so Railway rebuilds from scratch on each deploy. See
+# docs/intelligence-plan.md's stage 2 storage note for why this will
+# need to change once outcome tracking depends on journal history
+# surviving a redeploy.
 data/wallet_scores.json
 data/paper_ledger.json
+data/decisions.jsonl
 data/alerts.log
 
 # --- IDE / editor ---
