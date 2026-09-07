@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Set, Tuple
 
 from src.alerts.telegram import TelegramAlerter
 from src.agent.ledger import PaperLedger
+from src.agent.journal import DecisionJournal
 from src.data.birdeye import Birdeye
 from src.data.dexscreener import DexScreener
 from src.data.gmgn import GMGNClient
@@ -66,6 +67,11 @@ class MemecoinAgent:
             starting_capital=10_000.0,
             position_pct=config["rules"].get("portfolio_risk", {}).get("max_position_pct_of_capital", 5.0),
         )
+        # Stage 1 of docs/intelligence-plan.md: record every evaluation
+        # (pass or fail) with its full feature snapshot, so future stages
+        # can measure whether a rule/threshold is actually any good
+        # instead of guessing. Pure observability - see journal.py.
+        self.journal = DecisionJournal()
         # Wallet scorer — assigns Tier 1/2/3 based on win rate + ROI + recency.
         # Stage 6: pass the GMGN client only when it's actually usable
         # (flag + real key, same self.gmgn_enabled every other GMGN-gated
@@ -373,6 +379,7 @@ class MemecoinAgent:
             passes_mom, mom_failures = self.engine.passes_momentum_filter(token)
             if not passes_mom:
                 momentum_rejects += 1
+                self.journal.record_momentum_reject(token, mom_failures)
                 continue
             survivors.append(token)
         if momentum_rejects:
@@ -384,6 +391,13 @@ class MemecoinAgent:
         verdicts: List[Verdict] = []
         for token in survivors:
             verdict = self.engine.evaluate(token)
+            # Journaled BEFORE the wallet-tier boost below, deliberately:
+            # stage 1 exists to measure the rule engine's own judgment,
+            # and apply_wallet_signal returns a new verdict layering a
+            # separate signal source on top. Conflating the two here would
+            # make it impossible to later ask "are the RULE thresholds
+            # good" independent of "did a tracked wallet buy it".
+            self.journal.record_verdict(token, verdict)
             # Upgrade tier based on WHICH tier of wallet(s) is buying.
             # Tier 1 = strong Tier A boost (top 10% wallets)
             # Tier 2 = moderate boost
