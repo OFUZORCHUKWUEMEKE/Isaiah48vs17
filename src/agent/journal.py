@@ -70,9 +70,14 @@ class DecisionJournal:
         engine. Recorded pre-enrichment-complete, so the feature set here
         may be thinner than an 'evaluated' record's - that's expected,
         not a bug, and stage 3's report should treat these separately.
+
+        Returns the record's id (for OutcomeTracker to key an outcome
+        sample against later - stage 2), or None if the write failed,
+        in which case there is nothing valid to attach an outcome to.
         """
-        self._append({
-            "id": str(uuid.uuid4()),
+        record_id = str(uuid.uuid4())
+        ok = self._append({
+            "id": record_id,
             "ts": time.time(),
             "kind": "momentum_reject",
             "address": token.get("address", ""),
@@ -85,14 +90,17 @@ class DecisionJournal:
             "failures": list(failures),
             "features": _extract_features(token),
         })
+        return record_id if ok else None
 
-    def record_verdict(self, token: Dict[str, Any], verdict: Any) -> None:
+    def record_verdict(self, token: Dict[str, Any], verdict: Any) -> Optional[str]:
         """Token reached RuleEngine.evaluate() and produced a real Verdict
         (pass or fail - evaluate() always returns the highest-scoring
-        candidate across strategies, never None).
+        candidate across strategies, never None). Returns the record's
+        id, or None if the write failed - see record_momentum_reject.
         """
-        self._append({
-            "id": str(uuid.uuid4()),
+        record_id = str(uuid.uuid4())
+        ok = self._append({
+            "id": record_id,
             "ts": verdict.timestamp,
             "kind": "evaluated",
             "address": verdict.token_address or token.get("address", ""),
@@ -105,17 +113,59 @@ class DecisionJournal:
             "failures": list(verdict.failures),
             "features": _extract_features(token),
         })
+        return record_id if ok else None
 
-    def _append(self, record: Dict[str, Any]) -> None:
+    def record_outcome(
+        self,
+        decision_id: str,
+        horizon: str,
+        entry_mcap_usd: Optional[float],
+        entry_price_usd: Optional[float],
+        market: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Stage 2: the real-world result of a journaled decision, sampled
+        at a fixed horizon after it was made. `market` is whatever
+        DexScreener.get_current_market() returned - None means no pair
+        was found at all (pool pulled / token dead), which is recorded
+        as such rather than assumed to be a -100% loss, since fabricating
+        a number here would corrupt stage 3's report the same way the
+        rule engine's original hardcoded constants did.
+
+        A separate record (not an in-place edit of the decision record)
+        because the journal is append-only by design - see the module
+        docstring. Stage 3 joins on decision_id.
+        """
+        pct_change_mcap = None
+        if market and entry_mcap_usd and entry_mcap_usd > 0:
+            pct_change_mcap = (market["mcap_usd"] - entry_mcap_usd) / entry_mcap_usd * 100
+        record_id = str(uuid.uuid4())
+        ok = self._append({
+            "id": record_id,
+            "ts": time.time(),
+            "kind": "outcome",
+            "decision_id": decision_id,
+            "horizon": horizon,
+            "entry_mcap_usd": entry_mcap_usd,
+            "entry_price_usd": entry_price_usd,
+            "current_mcap_usd": market["mcap_usd"] if market else None,
+            "current_price_usd": market["price_usd"] if market else None,
+            "pct_change_mcap": pct_change_mcap,
+            "no_pair_found": market is None,
+        })
+        return record_id if ok else None
+
+    def _append(self, record: Dict[str, Any]) -> bool:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.path, "a") as f:
                 f.write(json.dumps(record, default=str) + "\n")
             self._count += 1
+            return True
         except Exception as e:
             # Journaling is observability, not the trading path - a
             # write failure here must never take down a scan cycle.
             log.error(f"Failed to write decision journal record: {e}")
+            return False
 
     def stats(self) -> Dict[str, Any]:
         return {
