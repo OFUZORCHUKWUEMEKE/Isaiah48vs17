@@ -387,9 +387,21 @@ class MemecoinAgent:
             # Add mock pro-trader data if not present
             token.setdefault("pro_traders", 50)
             token.setdefault("fib_retracement", 0)
-            # Apply momentum filter first (video 2.5: only active coins)
+            # Apply momentum filter first (video 2.5: only active coins) -
+            # EXCEPT for pump.fun pre-migration candidates. The filter's
+            # 1h-volume/1h-txns/buy-sell-ratio checks assume a token old
+            # enough to have that history; a pre-migration coin is
+            # deliberately caught before it has one (that's the entire
+            # premise of pre_migration_sniping), so every such candidate
+            # defaults volume_1h_usd to 0 and gets hard-rejected here
+            # 100% of the time regardless of how good it actually looks.
+            # This was flagged as "disabled AND structurally unreachable"
+            # in the original GMGN integration review - fixed by
+            # exempting this token class rather than by the enabled flag
+            # alone, which would have kept doing nothing.
+            is_pre_migration = token.get("source") == "pumpfun"
             passes_mom, mom_failures = self.engine.passes_momentum_filter(token)
-            if not passes_mom:
+            if not passes_mom and not is_pre_migration:
                 momentum_rejects += 1
                 decision_id = self.journal.record_momentum_reject(token, mom_failures)
                 self.outcomes.schedule(

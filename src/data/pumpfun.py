@@ -54,6 +54,11 @@ class PumpFun:
                     "age_minutes": age_min,
                     "reply_count": c.get("reply_count", 0),
                     "king_of_the_hill": c.get("king_of_the_hill", False),
+                    # Lets the pipeline identify pre-migration candidates
+                    # unambiguously (see loop.py's momentum-filter
+                    # exemption) rather than duck-typing on which fields
+                    # happen to be missing.
+                    "source": "pumpfun",
                     "raw": c,
                 })
         return out
