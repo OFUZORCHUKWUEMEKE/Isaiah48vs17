@@ -70,6 +70,30 @@ class DexScreener:
             log.error(f"DexScreener get_token_pairs({token_address}) failed: {e}")
             return []
 
+    async def get_current_market(self, token_address: str) -> Optional[Dict[str, Any]]:
+        """Current mcap/price for one address - used by OutcomeTracker
+        (src/agent/outcomes.py, intelligence plan stage 2) to sample a
+        journaled decision's real-world outcome at a fixed horizon.
+
+        Picks the highest-liquidity pair when a token has several (the
+        most reliable price source), and returns None - not zeros - when
+        no pair exists at all, since that's itself informative (the pool
+        was pulled / never existed at this address) and must not be
+        confused with "token is worth 0".
+        """
+        pairs = await self.get_token_pairs(token_address)
+        if not pairs:
+            return None
+        best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
+        normalized = self._normalize(best)
+        if not normalized:
+            return None
+        return {
+            "mcap_usd": normalized["mcap_usd"],
+            "price_usd": normalized["price_usd"],
+            "liquidity_usd": normalized["liquidity_usd"],
+        }
+
     async def get_solana_runners(self, min_volume_5m: float = 30000,
                                   min_mcap: float = 0,
                                   max_mcap: float = float("inf"),

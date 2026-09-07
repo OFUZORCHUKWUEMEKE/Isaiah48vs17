@@ -116,6 +116,7 @@ def _get_status() -> Dict[str, Any]:
                 "base_url": getattr(getattr(_agent_ref, "gmgn", None), "base_url", None),
             },
             "journal": _agent_ref.journal.stats() if getattr(_agent_ref, "journal", None) else {},
+            "outcomes": _agent_ref.outcomes.stats() if getattr(_agent_ref, "outcomes", None) else {},
             "tracked_wallets": len(_agent_ref.tracked_wallets),
             "tier_breakdown": breakdown,
             "alerts_sent_today": _agent_ref.alerter._today_count,

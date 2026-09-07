@@ -39,6 +39,7 @@ node_modules/
 data/wallet_scores.json
 data/paper_ledger.json
 data/decisions.jsonl
+data/pending_outcomes.json
 data/alerts.log
 
 # --- IDE / editor ---

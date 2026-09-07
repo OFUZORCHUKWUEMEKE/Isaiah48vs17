@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Set, Tuple
 from src.alerts.telegram import TelegramAlerter
 from src.agent.ledger import PaperLedger
 from src.agent.journal import DecisionJournal
+from src.agent.outcomes import OutcomeTracker
 from src.data.birdeye import Birdeye
 from src.data.dexscreener import DexScreener
 from src.data.gmgn import GMGNClient
@@ -72,6 +73,11 @@ class MemecoinAgent:
         # can measure whether a rule/threshold is actually any good
         # instead of guessing. Pure observability - see journal.py.
         self.journal = DecisionJournal()
+        # Stage 2: sample what actually happened to every journaled
+        # decision at 15m/1h/4h/24h. Uses self.dex (DexScreener, free/
+        # always-real - see outcomes.py) rather than GMGN/Birdeye so
+        # outcome sampling works regardless of which paid keys are set.
+        self.outcomes = OutcomeTracker(self.dex, self.journal)
         # Wallet scorer — assigns Tier 1/2/3 based on win rate + ROI + recency.
         # Stage 6: pass the GMGN client only when it's actually usable
         # (flag + real key, same self.gmgn_enabled every other GMGN-gated
@@ -169,6 +175,11 @@ class MemecoinAgent:
         summary_task = asyncio.create_task(self._daily_summary_loop(summary_utc))
         log.info(f"Daily summary scheduled for {summary_utc} UTC")
 
+        # Stage 2 of docs/intelligence-plan.md: sample outcomes for every
+        # journaled decision at its 15m/1h/4h/24h checkpoints.
+        outcomes_task = asyncio.create_task(self.outcomes.run_periodic())
+        log.info("Outcome tracker started (checks every 5 min)")
+
         # Start the health/HTTP server so Railway (or any host) can ping us
         try:
             from src.agent.health_server import set_agent, start_health_server
@@ -208,6 +219,7 @@ class MemecoinAgent:
             log.info("Shutting down (KeyboardInterrupt)...")
         finally:
             summary_task.cancel()
+            outcomes_task.cancel()
             await self._shutdown()
 
     async def _enrich(self, token: Dict[str, Any]) -> Dict[str, Any]:
@@ -379,7 +391,11 @@ class MemecoinAgent:
             passes_mom, mom_failures = self.engine.passes_momentum_filter(token)
             if not passes_mom:
                 momentum_rejects += 1
-                self.journal.record_momentum_reject(token, mom_failures)
+                decision_id = self.journal.record_momentum_reject(token, mom_failures)
+                self.outcomes.schedule(
+                    decision_id, token.get("address", ""), token.get("symbol", "?"),
+                    token.get("mcap_usd"), token.get("price_usd"),
+                )
                 continue
             survivors.append(token)
         if momentum_rejects:
@@ -397,7 +413,11 @@ class MemecoinAgent:
             # separate signal source on top. Conflating the two here would
             # make it impossible to later ask "are the RULE thresholds
             # good" independent of "did a tracked wallet buy it".
-            self.journal.record_verdict(token, verdict)
+            decision_id = self.journal.record_verdict(token, verdict)
+            self.outcomes.schedule(
+                decision_id, token.get("address", ""), token.get("symbol", "?"),
+                token.get("mcap_usd"), token.get("price_usd"),
+            )
             # Upgrade tier based on WHICH tier of wallet(s) is buying.
             # Tier 1 = strong Tier A boost (top 10% wallets)
             # Tier 2 = moderate boost
