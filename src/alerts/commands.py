@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from src.agent.report import build_report, format_report_text
 from src.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -38,7 +39,8 @@ def register_commands(alerter: "TelegramAlerter", agent):
             "/stats — paper P&amp;L and bot status\n"
             "/positions — open paper positions\n"
             "/wallets [top|rescore] — tier breakdown + recent buys\n"
-            "/alerts [N] — last N alerts (default 5)\n\n"
+            "/alerts [N] — last N alerts (default 5)\n"
+            "/report — calibration: how alerted/rejected tokens actually did\n\n"
             "<b>GMGN:</b>\n"
             "/gmgn &lt;address&gt; — holders, insiders, bundlers, rug ratio, security\n"
             "/trending — top 10 tokens by GMGN's rank\n"
@@ -399,6 +401,16 @@ def register_commands(alerter: "TelegramAlerter", agent):
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
+    # /report — stage 3 of docs/intelligence-plan.md: real outcomes,
+    # joined from the decision journal (stage 1) and outcome tracker
+    # (stage 2). Reads data/decisions.jsonl fresh on every call - no
+    # cached state to go stale.
+    # ------------------------------------------------------------------
+    async def cmd_report(args: str) -> str:
+        report = build_report(agent.journal.path)
+        return format_report_text(report)
+
+    # ------------------------------------------------------------------
     # /pause, /resume
     # ------------------------------------------------------------------
     async def cmd_pause(args: str) -> str:
@@ -424,6 +436,7 @@ def register_commands(alerter: "TelegramAlerter", agent):
     alerter.register_command("positions", cmd_positions)
     alerter.register_command("wallets", cmd_wallets)
     alerter.register_command("alerts", cmd_alerts)
+    alerter.register_command("report", cmd_report)
     alerter.register_command("scan", cmd_scan)
     alerter.register_command("setcap", cmd_setcap)
     alerter.register_command("closeall", cmd_closeall)
