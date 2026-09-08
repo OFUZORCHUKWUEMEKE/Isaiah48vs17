@@ -247,7 +247,7 @@
 
   "rules": {
     "pre_migration_sniping": {
-      "enabled": true,
+      "enabled": false,
       "min_mcap_usd": 20000,
       "max_mcap_usd": 40000,
       "migration_mcap_usd": 75000,
@@ -259,7 +259,7 @@
       "take_profit_1_pct": 100.0,
       "take_profit_1_sell_pct": 50.0,
       "stop_loss_pct": -20.0,
-      "_note": "Re-enabled at the user's explicit request (overriding the prior 'stay away from trenches' guidance from video 2.5/Sajad Flips - trenches are objectively higher rug/dump risk, this is a deliberate risk tradeoff for catching runners earlier, not a bug fix alone). Was previously disabled AND structurally unreachable even when enabled: passes_momentum_filter's 1h-volume/1h-txns checks hard-rejected every pump.fun candidate before it ever reached this strategy, since a pre-migration coin has no 1h history yet by definition. Fixed in loop.py's _evaluate_candidates by exempting source=='pumpfun' candidates from that filter rather than by this flag alone. min_pro_traders retuned 40->5 alongside pullback_trading's (see that block's note)."
+      "_note": "Disabled again at the user's request, shortly after re-enabling. The underlying reachability fix from that PR is left in place (passes_momentum_filter still exempts source=='pumpfun' candidates - see loop.py) since it's correct regardless of whether this strategy is on: it just means the momentum filter no longer wrongly gates a class of token this strategy was never meant to see anyway. This flag alone now genuinely controls whether pre-migration sniping runs, unlike before that fix. min_pro_traders stays retuned 40->5 alongside pullback_trading's (see that block's note) so it isn't miscalibrated again if re-enabled a second time."
     },
 
     "pullback_trading": {
